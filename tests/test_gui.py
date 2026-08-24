@@ -463,12 +463,17 @@ class StubMonitor:
     failure_reason = None
 
 
+class StubRate:
+    effective_window_s = 87.0
+
+
 class StubGenerator:
     """Enough of a Generator for _emit_status, with a draw that blocks."""
 
     def __init__(self, block_for: float = 0.0) -> None:
         self.pool = StubPool()
         self.monitor = StubMonitor()
+        self.rate = StubRate()
         self.count_rate = 16.0
         self.entropy_rate_bits_per_s = 20.0
         self.reservoir_bytes = 1024
@@ -547,6 +552,7 @@ def test_emit_status_reports_reserve_and_readiness():
     assert 0.0 <= payload['reservoir_fraction'] <= 1.0
     assert payload['cost_bits_per_byte'] > 0
     assert payload['drbg_seeded'] is True
+    assert payload['rate_window_s'] > 0
 
 
 def test_drbg_message_does_not_claim_to_be_short_of_entropy(app):

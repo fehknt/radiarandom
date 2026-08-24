@@ -96,6 +96,20 @@ MCV_HALF_LIFE_SAMPLES = 20000
 #: Longest gap we will pay for in one go. Guards against crediting a stall.
 MAX_CREDIT_GAP_S = 2.0
 
+#: Memory of the count-rate estimate, in seconds.
+#:
+#: Without forgetting this is a lifetime average, and a lifetime average only
+#: converges as the run doubles in length. Measured: after 20 minutes at
+#: 16 counts/s, removing the source and waiting another 20 minutes still
+#: reported 10.5 counts/s against a true 5. That is not merely a stale display
+#: -- the entropy budget scales with the rate, so a stale-high estimate
+#: over-credits.
+#:
+#: A 60 s half-life gives an effective window of ~87 s. At 5 counts/s that is
+#: ~430 events, so the Poisson lower bound sits about 12% under the truth --
+#: conservative, which is the direction that is safe to be wrong in.
+RATE_HALF_LIFE_S = 60.0
+
 
 def log2_factorial(n: int) -> float:
     """``log2(n!)`` via lgamma, so large ``n`` stays cheap."""
@@ -236,23 +250,41 @@ def default_assessment(
 
 
 class RateEstimator:
-    """Running count-rate estimate with a Poisson lower confidence bound.
+    """Exponentially-weighted count-rate estimate with a Poisson lower bound.
 
-    The budget scales with the rate, so an over-estimate would over-credit.
-    We therefore bank against the *lower* bound: with ``k`` photons observed
-    over ``t`` seconds the rate is at least about
-    ``(k - z*sqrt(k)) / t`` at the chosen confidence.
+    The budget scales with the rate, so an over-estimate over-credits. Two
+    guards against that:
+
+    * the estimate *forgets*, so it tracks the detector as it is now rather
+      than averaging in conditions that no longer hold;
+    * what gets banked is the lower confidence bound, not the point estimate:
+      with ``k`` effective events over ``t`` effective seconds the rate is at
+      least about ``(k - z*sqrt(k)) / t``.
     """
 
     Z = 2.576  # one-sided 99%
 
-    def __init__(self) -> None:
-        self.photons = 0
+    def __init__(self, half_life_s: Optional[float] = RATE_HALF_LIFE_S) -> None:
+        self.photons = 0.0
         self.seconds = 0.0
+        self.half_life_s = half_life_s
 
     def update(self, photons: int, elapsed: float) -> None:
+        elapsed = max(0.0, elapsed)
+        if self.half_life_s and elapsed > 0.0:
+            # Age both totals by the same factor: the ratio is then an
+            # exponentially-weighted rate, and `seconds` converges to the
+            # effective window (half_life / ln 2).
+            factor = 0.5 ** (elapsed / self.half_life_s)
+            self.photons *= factor
+            self.seconds *= factor
         self.photons += photons
-        self.seconds += max(0.0, elapsed)
+        self.seconds += elapsed
+
+    @property
+    def effective_window_s(self) -> float:
+        """Seconds of history the estimate is currently averaging over."""
+        return self.seconds
 
     @property
     def point_estimate(self) -> Optional[float]:

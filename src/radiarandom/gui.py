@@ -183,6 +183,7 @@ class _Worker(threading.Thread):
         drbg = generator.stats()['drbg']
         self.events.put(('metrics', {
             'count_rate': generator.count_rate,
+            'rate_window_s': generator.rate.effective_window_s,
             'entropy_rate': generator.entropy_rate_bits_per_s,
             'healthy': not generator.monitor.failed,
             'failure': generator.monitor.failure_reason,
@@ -533,8 +534,12 @@ class RandomApp:
         capacity = m.get('reservoir_capacity', 1)
         fraction = m.get('reservoir_fraction', 0.0)
 
+        # Name the averaging window: a smoothed rate that lags a change by a
+        # couple of minutes is confusing unless you can see it is smoothed.
+        window = m.get('rate_window_s') or 0.0
+        window_text = f' ({window:.0f}s avg)' if window >= 1.0 else ''
         self.metrics_var.set(
-            f'{rate:.1f} counts/s · {bits:.1f} bits/s · '
+            f'{rate:.1f} counts/s{window_text} · {bits:.1f} bits/s · '
             f'reserve {fraction * 100:.0f}% ({banked}/{capacity} B)')
         self.ready_var.set(self._readiness_text(m, banked, bits))
 

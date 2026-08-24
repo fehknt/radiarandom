@@ -246,3 +246,63 @@ def test_projected_rate_scales_with_count_rate():
     assert (entropy.projected_bit_rate(44.0, assessment)
             > entropy.projected_bit_rate(4.4, assessment))
     assert entropy.projected_bit_rate(0.0, assessment) == 0.0
+
+
+# --------------------------------------- the rate estimate must forget
+
+
+def _run(estimator, rate, seconds, step=1.0):
+    for _ in range(int(seconds / step)):
+        estimator.update(rate * step, step)
+
+
+def test_the_rate_estimate_tracks_a_source_being_removed():
+    """Reported from the UI: source removed, rate should be 5, still showed >9.
+
+    The estimator was a lifetime average, which only converges as the run
+    doubles in length -- after 20 minutes at 16 counts/s it still read 10.5
+    twenty minutes later. That is not just a stale display: the entropy budget
+    scales with the rate, so a stale-high estimate over-credits.
+    """
+    estimator = entropy.RateEstimator()
+    _run(estimator, 16.0, 1200)
+    assert estimator.point_estimate == pytest.approx(16.0, rel=0.02)
+
+    _run(estimator, 5.0, 180)
+    assert estimator.point_estimate < 7.0, 'should be most of the way down in 3 min'
+    _run(estimator, 5.0, 420)
+    assert estimator.point_estimate == pytest.approx(5.0, rel=0.05)
+
+
+def test_the_rate_estimate_tracks_a_source_being_added():
+    estimator = entropy.RateEstimator()
+    _run(estimator, 4.4, 600)
+    assert estimator.point_estimate == pytest.approx(4.4, rel=0.02)
+    _run(estimator, 16.0, 600)
+    assert estimator.point_estimate == pytest.approx(16.0, rel=0.05)
+
+
+def test_the_effective_window_is_bounded():
+    """A forgetting estimator averages over a fixed window, not the whole run."""
+    estimator = entropy.RateEstimator()
+    _run(estimator, 10.0, 3600)
+    assert estimator.effective_window_s < 5 * entropy.RATE_HALF_LIFE_S
+    assert estimator.effective_window_s > entropy.RATE_HALF_LIFE_S
+
+
+def test_the_lower_bound_stays_below_the_truth_after_a_change():
+    """What gets banked must never exceed the real rate, even mid-transition."""
+    estimator = entropy.RateEstimator()
+    _run(estimator, 16.0, 1200)
+    for _ in range(600):
+        estimator.update(5.0, 1.0)
+        bound = estimator.lower_bound()
+        if bound is not None and estimator.point_estimate < 5.2:
+            assert bound <= 5.0 + 1e-9
+
+
+def test_forgetting_can_be_disabled():
+    estimator = entropy.RateEstimator(half_life_s=None)
+    _run(estimator, 16.0, 100)
+    _run(estimator, 0.0, 100)
+    assert estimator.point_estimate == pytest.approx(8.0, rel=0.05)
