@@ -138,9 +138,18 @@ def test_a_queued_request_fires_once_the_generator_is_ready(window):
 
 
 def test_only_one_request_is_queued_however_many_presets_are_clicked(window):
+    """Last click wins, and the button says which one so it is not a guess.
+
+    Reported from the UI: clicking "D6, coin flip, D6" queued one entry, which
+    is the intent -- impatient clicking must not build a backlog -- but the
+    label gave no indication of that.
+    """
     for label, low, high, labels in gui.PRESETS:
         window._apply_preset(low, high, labels)
     assert window._queued is True
+    # The button names the draw that will actually run.
+    assert 'Queued:' in window.go['text']
+    assert '1–100' in window.go['text'], window.go['text']
     window.worker.events.put(('ready', None))
     window._pump_events()
     assert pump_until(window, lambda: not window.worker.commands.empty())
@@ -563,3 +572,34 @@ def test_drbg_message_does_report_a_genuine_shortfall(app):
     app._pump_events()
     ready = app.ready_var.get()
     assert 'needs 64 B to seed' in ready and '8 B banked' in ready
+
+
+def test_the_queued_label_names_a_coin_flip(window):
+    window._apply_preset(0, 1, ('Tails', 'Heads'))
+    assert 'coin flip' in window.go['text']
+
+
+def test_the_queued_label_follows_a_later_preset(window):
+    window._apply_preset(0, 1, ('Tails', 'Heads'))
+    assert 'coin flip' in window.go['text']
+    window._apply_preset(1, 6, None)
+    assert '1–6' in window.go['text'], window.go['text']
+    assert 'coin flip' not in window.go['text']
+
+
+def test_the_queued_label_shows_batch_size(window):
+    window.count_var.set('5')
+    window._apply_preset(1, 100, None)
+    assert '5 × 1–100' in window.go['text'], window.go['text']
+
+
+def test_calibration_finishes_well_before_the_startup_gate():
+    """The fitted cutoff must be armed for most of the start-up test.
+
+    Tying calibration to the gate meant the whole gate ran under the permissive
+    hard ceiling, which is the weakest the proportion test ever is.
+    """
+    from radiarandom import health
+    monitor = health.HealthMonitor(h_per_photon=4.0,
+                                   startup_samples=health.STARTUP_SAMPLES)
+    assert monitor.calibrate_photons < monitor.startup_progress[1] / 2

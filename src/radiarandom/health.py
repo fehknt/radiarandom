@@ -71,7 +71,27 @@ PROPORTION_WINDOW = 512
 REPEAT_CUTOFF = 3
 
 #: Photons that must pass before output is permitted (SP 800-90B 4.3).
+#:
+#: This is a *safety gate*, not a tuning parameter, and it is the number the
+#: standard specifies. Continuous re-calibration is no argument for shortening
+#: it: re-calibration adapts to whatever the detector is doing, so an initial
+#: gate is what stops the system calibrating itself onto a fault and then
+#: adapting comfortably around it.
 STARTUP_SAMPLES = 1024
+
+#: Photons used to establish the initial spectral baseline and cutoff.
+#:
+#: Deliberately much shorter than the start-up gate, and decoupled from it.
+#: While calibrating, only the hard ceiling applies -- so tying the two
+#: together meant the *entire* start-up test ran under the permissive cutoff.
+#: Finishing calibration early arms the fitted cutoff for the remaining ~768
+#: photons of the gate, which is strictly safer at no cost in waiting.
+#:
+#: A short baseline is thin, and its confidence margin is correspondingly wide,
+#: which makes the first cutoff permissive rather than tight -- the safe
+#: direction for false alarms. It is re-derived every 4096 photons thereafter
+#: and tightens as evidence accumulates.
+CALIBRATE_PHOTONS = 256
 
 #: No single channel may ever exceed this fraction of the proportion window,
 #: however peaky the calibrated spectrum is. This is the floor that still
@@ -269,11 +289,13 @@ class HealthMonitor:
         # then watch for drift away from *that*, which is what actually
         # indicates a gain or bias-voltage fault. The lifetime spectrum is kept
         # only for a one-shot informational comparison once calibration ends.
-        # Calibration must complete no later than the start-up test, so that
-        # the permissive calibration phase never overlaps with output.
+        # Calibration must complete no later than the start-up test, so the
+        # permissive calibration phase never overlaps with output -- and should
+        # finish well before it, so the gate is enforced with a fitted cutoff.
         self.calibrate_photons = (
             calibrate_photons if calibrate_photons is not None
-            else (startup_samples if startup_samples > 0 else 2048)
+            else (min(CALIBRATE_PHOTONS, startup_samples) if startup_samples > 0
+                  else CALIBRATE_PHOTONS)
         )
         self._prior_shape = self._coarse(reference_spectrum) if reference_spectrum else None
         self._reference_shape: Optional[list[float]] = None

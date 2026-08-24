@@ -374,8 +374,12 @@ class RandomApp:
         if self._pending:
             return
         if not self._ready:
+            # One request, not a backlog: clicking four presets while waiting
+            # should give the last one rather than four draws. Naming it makes
+            # that visible instead of leaving the user to infer it.
             self._queued = True
-            self.go.config(text='Queued — starts after calibration')
+            self.go.config(
+                text=f'Queued: {self._draw_description()} — runs after calibration')
             return
         parsed = self._read_range()
         if parsed is None:
@@ -490,6 +494,21 @@ class RandomApp:
             pass
         self.root.after(POLL_MS, self._pump_events)
 
+    def _draw_description(self) -> str:
+        """A short name for the draw the current settings would produce."""
+        if self._labels and len(self._labels) == 2:
+            base = 'coin flip'
+        else:
+            try:
+                base = f'{int(self.min_var.get())}–{int(self.max_var.get())}'
+            except (ValueError, self.tk.TclError):
+                return 'a draw'
+        try:
+            count = int(self.count_var.get())
+        except (ValueError, self.tk.TclError):
+            count = 1
+        return f'{count} × {base}' if count > 1 else base
+
     def _draw_bytes(self) -> int:
         """Bytes one draw of the current range needs, at minimum."""
         try:
@@ -570,6 +589,9 @@ class RandomApp:
 
     def _refresh_readiness(self) -> None:
         """Recompute the readiness line after a range or mode change."""
+        if self._queued and not self._ready:
+            self.go.config(
+                text=f'Queued: {self._draw_description()} — runs after calibration')
         if self._metrics:
             self._render_metrics(self._metrics)
 
