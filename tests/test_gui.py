@@ -75,6 +75,21 @@ def app(window):
     return window
 
 
+def pump_until(window, predicate, timeout=3.0):
+    """Spin the Tk event loop until predicate() or the timeout expires.
+
+    after() callbacks only run once their delay has elapsed, so a bare
+    update() is a race.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        window.root.update()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def drain(worker):
     out = []
     while True:
@@ -92,11 +107,69 @@ def test_window_builds_and_starts_its_worker(app):
     assert app.result_var.get() == '–'
 
 
-def test_generate_is_disabled_until_ready(window):
-    """Nothing may be drawn before the SP 800-90B start-up test passes."""
-    assert str(window.go['state']) == 'disabled'
+def test_nothing_is_drawn_before_the_startup_test_passes(window):
+    """No output may leave before start-up completes -- but say so, not nothing."""
     window._on_generate()
+    assert drain(window.worker) == [], 'must not reach the device yet'
+    assert window._queued is True
+    assert 'Queued' in window.go['text']
+
+
+def test_a_queued_request_fires_once_the_generator_is_ready(window):
+    """A preset clicked during calibration should still produce a number.
+
+    Previously the preset buttons were live but _apply_preset only drew when
+    already ready, so clicking "D6" while calibrating did nothing at all and
+    gave no hint why.
+    """
+    window._apply_preset(1, 6, None)
+    assert window._queued is True
     assert drain(window.worker) == []
+
+    window.worker.events.put(('ready', None))
+    window._pump_events()
+    assert window._queued is False
+    assert pump_until(window, lambda: not window.worker.commands.empty())
+    commands = drain(window.worker)
+    assert len(commands) == 1
+    kind, payload = commands[0]
+    assert kind == 'draw'
+    assert (payload['low'], payload['high']) == (1, 6)
+
+
+def test_only_one_request_is_queued_however_many_presets_are_clicked(window):
+    for label, low, high, labels in gui.PRESETS:
+        window._apply_preset(low, high, labels)
+    assert window._queued is True
+    window.worker.events.put(('ready', None))
+    window._pump_events()
+    assert pump_until(window, lambda: not window.worker.commands.empty())
+    assert len(drain(window.worker)) == 1, 'no backlog of impatient clicks'
+
+
+def test_a_queued_request_is_dropped_on_failure(window, monkeypatch):
+    monkeypatch.setattr('tkinter.messagebox.showerror', lambda *a, **k: None)
+    window._on_generate()
+    assert window._queued is True
+    window.worker.events.put(('fatal', 'detector unplugged'))
+    window._pump_events()
+    assert window._queued is False
+
+
+def test_history_buttons_are_disabled_until_there_is_history(window):
+    """Buttons that cannot do anything should look like it."""
+    for button in (window.copy_last_button, window.copy_all_button,
+                   window.clear_button):
+        assert str(button['state']) == 'disabled'
+
+
+def test_history_buttons_enable_once_a_result_arrives_and_disable_on_clear(app):
+    app._render([7])
+    for button in (app.copy_last_button, app.copy_all_button, app.clear_button):
+        assert str(button['state']) == 'normal'
+    app._clear()
+    for button in (app.copy_last_button, app.copy_all_button, app.clear_button):
+        assert str(button['state']) == 'disabled'
 
 
 def test_every_preset_is_applicable(app):
@@ -465,3 +538,28 @@ def test_emit_status_reports_reserve_and_readiness():
     assert 0.0 <= payload['reservoir_fraction'] <= 1.0
     assert payload['cost_bits_per_byte'] > 0
     assert payload['drbg_seeded'] is True
+
+
+def test_drbg_message_does_not_claim_to_be_short_of_entropy(app):
+    """Reported from the running UI: 256 B banked, "needs 64 B", not seeded.
+
+    The DRBG is instantiated lazily on the first draw, so an unseeded DRBG with
+    a full reserve is waiting on a request, not on the detector. Saying it
+    needed entropy it already had was just wrong.
+    """
+    app.physical_var.set(False)
+    metrics = dict(HEALTHY_METRICS, drbg_seeded=False, reservoir_bytes=256)
+    app.worker.events.put(('metrics', metrics))
+    app._pump_events()
+    ready = app.ready_var.get()
+    assert 'seeds from the reserve on your first draw' in ready
+    assert '256 B banked' in ready
+
+
+def test_drbg_message_does_report_a_genuine_shortfall(app):
+    app.physical_var.set(False)
+    metrics = dict(HEALTHY_METRICS, drbg_seeded=False, reservoir_bytes=8)
+    app.worker.events.put(('metrics', metrics))
+    app._pump_events()
+    ready = app.ready_var.get()
+    assert 'needs 64 B to seed' in ready and '8 B banked' in ready

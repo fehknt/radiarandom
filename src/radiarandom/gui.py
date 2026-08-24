@@ -222,6 +222,10 @@ class RandomApp:
         self._history: list = []
         self._identity = ''
         self._metrics: dict = {}
+        # A draw asked for before the start-up test finished. Exactly one is
+        # remembered: clicking four presets while waiting should produce the
+        # last one, not a backlog of four.
+        self._queued = False
 
         self.worker = _Worker(serial, startup_samples)
 
@@ -287,8 +291,10 @@ class RandomApp:
         # --- generate + rate limit
         actions = ttk.Frame(self.root)
         actions.pack(fill='x', **pad)
-        self.go = ttk.Button(actions, text='Generate', command=self._on_generate,
-                             state='disabled')
+        # Deliberately not disabled while calibrating. A dead button gives no
+        # feedback; this one queues the request and says so.
+        self.go = ttk.Button(actions, text='Generate when ready',
+                             command=self._on_generate)
         self.go.pack(fill='x', ipady=6)
 
         limit = ttk.Frame(actions)
@@ -319,9 +325,15 @@ class RandomApp:
         self.history.pack(fill='both', expand=True, padx=6, pady=(6, 0))
         buttons = ttk.Frame(hist)
         buttons.pack(fill='x', padx=6, pady=6)
-        ttk.Button(buttons, text='Copy last', command=self._copy_last).pack(side='left')
-        ttk.Button(buttons, text='Copy all', command=self._copy_all).pack(side='left', padx=6)
-        ttk.Button(buttons, text='Clear', command=self._clear).pack(side='right')
+        self.copy_last_button = ttk.Button(buttons, text='Copy last',
+                                           command=self._copy_last, state='disabled')
+        self.copy_last_button.pack(side='left')
+        self.copy_all_button = ttk.Button(buttons, text='Copy all',
+                                          command=self._copy_all, state='disabled')
+        self.copy_all_button.pack(side='left', padx=6)
+        self.clear_button = ttk.Button(buttons, text='Clear',
+                                       command=self._clear, state='disabled')
+        self.clear_button.pack(side='right')
 
     # --------------------------------------------------------------- actions
 
@@ -329,8 +341,10 @@ class RandomApp:
         self.min_var.set(str(low))
         self.max_var.set(str(high))
         self._labels = labels
-        if self._ready:
-            self._on_generate()
+        self._refresh_readiness()
+        # Always ask. Before start-up completes this queues instead of drawing,
+        # which is better than a preset button that appears to do nothing.
+        self._on_generate()
 
     def _read_range(self) -> Optional[tuple]:
         from tkinter import messagebox
@@ -356,8 +370,12 @@ class RandomApp:
         return 1.0 / max(MIN_RATE, min(MAX_RATE, rate))
 
     def _on_generate(self) -> None:
-        """Draw now, or as soon as the rate limit allows."""
-        if not self._ready or self._pending:
+        """Draw now, or as soon as the generator and the rate limit allow."""
+        if self._pending:
+            return
+        if not self._ready:
+            self._queued = True
+            self.go.config(text='Queued — starts after calibration')
             return
         parsed = self._read_range()
         if parsed is None:
@@ -396,6 +414,8 @@ class RandomApp:
         self.result_var.set(shown)
         self._history.insert(0, shown)
         self.history.insert(0, shown)
+        for button in (self.copy_last_button, self.copy_all_button, self.clear_button):
+            button.config(state='normal')
         if self.history.size() > 200:
             self.history.delete(200, 'end')
             del self._history[200:]
@@ -416,6 +436,8 @@ class RandomApp:
         self._history.clear()
         self.history.delete(0, 'end')
         self.result_var.set('–')
+        for button in (self.copy_last_button, self.copy_all_button, self.clear_button):
+            button.config(state='disabled')
 
     # ---------------------------------------------------------------- events
 
@@ -442,6 +464,9 @@ class RandomApp:
                     self._ready = True
                     self.progress['value'] = 1000
                     self.go.config(state='normal', text='Generate')
+                    if self._queued:
+                        self._queued = False
+                        self.root.after(10, self._on_generate)
                     # Put the device identity back; the start-up message has
                     # been sitting there since before the test began.
                     self.status_var.set(self._identity or 'Ready')
@@ -456,6 +481,7 @@ class RandomApp:
                         self.root.after(10, self._on_generate)
                 elif kind == 'fatal':
                     self._ready = False
+                    self._queued = False
                     self.auto_var.set(False)
                     self.go.config(state='disabled', text='Unavailable')
                     self.status_var.set('Stopped')
@@ -507,7 +533,17 @@ class RandomApp:
 
         if not self.physical_var.get():
             if not m.get('drbg_seeded'):
-                return f'DRBG not seeded yet — needs {2 * BLOCK_BYTES} B of reserve'
+                # The DRBG is instantiated lazily, on the first draw. Saying it
+                # "needs 64 B" while 256 B sit banked was simply wrong: it is
+                # not waiting on entropy, it is waiting on a request.
+                need = 2 * BLOCK_BYTES
+                if banked >= need:
+                    return (f'DRBG ready — seeds from the reserve on your first '
+                            f'draw ({banked} B banked, needs {need} B)')
+                wait = (need - banked) * cost / bits if bits > 0 else float('inf')
+                wait_text = f'{wait:.0f}s' if wait < 3600 else 'a long time'
+                return (f'DRBG needs {need} B to seed — {banked} B banked, '
+                        f'about {wait_text}')
             since = m.get('seconds_since_reseed')
             when = f'{since:.0f}s ago' if since is not None else 'not yet'
             return (f'DRBG ready — unlimited draws · reseeded {when} · '
