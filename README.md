@@ -314,10 +314,70 @@ radiarandom selftest
 
 ---
 
+## The GUI
+
+```bash
+radiarandom gui
+```
+
+```
+┌──────────────────────────────────────────────┐
+│ RC-103-013128 — firmware 4.14                │
+│ 16.2 counts/s · 19.2 bits/s entropy          │
+│ ████████████████████████████████████████████ │
+├──────────────────────────────────────────────┤
+│                                              │
+│                     79                       │
+│                                              │
+├─ Quick picks ────────────────────────────────┤
+│ [Coin flip] [D6] [1 – 10] [1 – 100]          │
+├─ Range ──────────────────────────────────────┤
+│ Min [1]   Max [100]   How many [1]           │
+├──────────────────────────────────────────────┤
+│ [              Generate              ]       │
+│ ☐ Repeat automatically  no faster than [2.0] │
+├─ Source ─────────────────────────────────────┤
+│ ◉ Fast — DRBG seeded by the detector         │
+│ ○ True entropy — detector rate only (slow)   │
+├─ History ────────────────────────────────────┤
+│ 79 · Heads · 2 · 10 · ...                    │
+│ [Copy last] [Copy all]              [Clear]  │
+└──────────────────────────────────────────────┘
+```
+
+Quick picks for **coin flip**, **D6**, **1–10** and **1–100**, plus arbitrary
+min/max and a "how many" box for rolling several at once. Every draw goes
+through the same unbiased rejection sampling the CLI uses, so a d6 really is a
+d6.
+
+Two controls worth explaining:
+
+- **"no faster than N/sec"** caps the draw rate. It applies to auto-repeat and
+  to rapid clicking alike, and when a click is throttled the button says
+  `Rate limited — 0.4s` and then fires, rather than silently doing nothing.
+- **Source** picks fast DRBG output or true detector-rate entropy. In physical
+  mode the progress bar becomes a pool gauge and a draw genuinely takes
+  seconds — 16 s was typical on this hardware — so the button tells you it is
+  waiting for photons.
+
+It is Tkinter, which ships with CPython on Windows and macOS. On Linux:
+
+```bash
+sudo apt install python3-tk     # or: sudo dnf install python3-tkinter
+```
+
+The window opens immediately and shows start-up progress rather than freezing,
+because the SP 800-90B start-up test takes a minute or more. If another
+`radiarandom` process is holding the detector it says so in words — only one
+process can have it at a time.
+
+---
+
 ## Command reference
 
 | Command | Purpose |
 |---|---|
+| `gui` | graphical front end: presets, min/max, rate limit, history |
 | `info` | device identity, measured rate, entropy budget, platform capability |
 | `bench` | measure the achievable entropy rate |
 | `selftest` | run the health tests and exercise both output modes |

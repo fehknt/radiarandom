@@ -68,11 +68,18 @@ class Generator:
         reference_spectrum: Optional[Sequence[float]] = None,
         safety_factor: float = entropy_mod.DEFAULT_SAFETY_FACTOR,
         h_channel: float = entropy_mod.DEFAULT_H_CHANNEL,
-        personalization: bytes = b'radiarandom',
+        personalization: Optional[bytes] = None,
     ) -> None:
         self.source = source
         self.use_live_estimate = use_live_estimate
-        self.personalization = personalization
+        # SP 800-90A 8.7.1 recommends a personalization string carrying
+        # something instance-unique. It is a domain separator, not entropy, and
+        # is never credited as such -- but it means two generators cannot land
+        # on the same output stream even if their sources were somehow
+        # identical, which a fixed constant would not guarantee.
+        self.personalization = (
+            personalization if personalization is not None
+            else self._default_personalization(source))
         self.safety_factor = safety_factor
         self.reference_probs = (
             entropy_mod.normalise(reference_spectrum) if reference_spectrum else None
@@ -111,6 +118,16 @@ class Generator:
         self._last_credit_monotonic: Optional[float] = None
         self._last_rate_monotonic: Optional[float] = None
         self._last_device_seconds: Optional[int] = None
+
+    @staticmethod
+    def _default_personalization(source) -> bytes:
+        """Device serial plus instantiation time, as a domain separator."""
+        try:
+            serial = source.serial()
+        except Exception:  # pragma: no cover - source may not expose one
+            serial = 'unknown'
+        return b'radiarandom|%s|%r' % (str(serial).encode('utf-8', 'replace'),
+                                       time.time())
 
     # ------------------------------------------------------------------ pump
 

@@ -29,9 +29,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      # The Tk tests need a display. Without one they skip cleanly, but a
+      # virtual framebuffer is cheap and means the GUI is actually exercised
+      # on Linux rather than only on the Windows runners.
+      - name: Install Xvfb
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
       # No detector in CI: the suite drives a simulated source from conftest.py,
       # which can also be made to stall, collapse, or reset on demand.
+      - name: Unit tests (Linux, under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest tests/ -q
       - name: Unit tests
+        if: runner.os != 'Linux'
         run: python -m pytest tests/ -q
       - name: Portable battery self-test
         run: python validation/localtests.py --self-test

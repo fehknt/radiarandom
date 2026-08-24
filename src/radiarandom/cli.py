@@ -10,6 +10,7 @@
     radiarandom raw --duration 3600       capture the noise source for analysis
     radiarandom feed                      contribute to the Linux kernel pool
     radiarandom serve                     serve entropy over a pipe or socket
+    radiarandom gui                       graphical front end for quick numbers
 
 A note on latency: the SP 800-90B start-up test needs 1024 photons before any
 output is permitted, which on indoor background is two to four minutes. Every
@@ -612,6 +613,13 @@ def cmd_raw(args) -> int:
     return EXIT_OK
 
 
+def cmd_gui(args) -> int:
+    """Launch the graphical front end. Tkinter is imported lazily so the rest
+    of the CLI still works on a headless box with no Tk installed."""
+    from . import gui
+    return gui.run(serial=args.serial, startup_samples=args.startup_samples)
+
+
 def cmd_feed(args) -> int:
     if not sys.platform.startswith('linux'):
         print('radiarandom feed is Linux-only.', file=sys.stderr)
@@ -814,6 +822,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument('--chunk', type=int, default=4096)
     p_serve.add_argument('--physical', action='store_true',
                          help='serve full-entropy output at the detector rate')
+
+    p_gui = subparsers.add_parser(
+        'gui', help='Launch the graphical front end.',
+        description='Launch the graphical front end (needs Tkinter).')
+    p_gui.set_defaults(func=cmd_gui)
+    p_gui.add_argument('--serial', help='USB serial number, if several are attached')
+    p_gui.add_argument('--startup-samples', type=int, default=STARTUP_SAMPLES,
+                       metavar='N',
+                       help='photons the SP 800-90B start-up test must pass '
+                            f'(default {STARTUP_SAMPLES})')
 
     p_seed = sub('seed-file', cmd_seed_file, 'Write a full-entropy seed file (mode 0600).')
     p_seed.add_argument('path')

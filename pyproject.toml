@@ -34,6 +34,7 @@ dev = ["pytest>=7"]
 
 [project.scripts]
 radiarandom = "radiarandom.cli:main"
+radiarandom-gui = "radiarandom.gui:main"
 
 [project.urls]
 Homepage = "https://github.com/fehknt/radiarandom"

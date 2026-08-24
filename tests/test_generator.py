@@ -288,3 +288,35 @@ def test_rate_baseline_is_not_latched_from_the_first_few_seconds():
         generator.pump_once()
     # Ten batches is five simulated seconds: far too little to baseline on.
     assert generator.monitor.expected_count_rate is None
+
+
+def test_identically_seeded_sources_still_produce_different_streams():
+    """Two generators must never collide, even on identical simulated input.
+
+    A real detector cannot replay a photon stream, so this can only happen in
+    simulation -- but a constant personalization string would make it happen
+    there, and CI caught exactly that. SP 800-90A 8.7.1 asks for something
+    instance-unique; the serial and instantiation time supply it. The string is
+    a domain separator and is never credited as entropy.
+    """
+    a = build(FakeSource(seed=777, count_rate=2000.0), startup_samples=8)
+    b = build(FakeSource(seed=777, count_rate=2000.0), startup_samples=8)
+    a.wait_for_startup()
+    b.wait_for_startup()
+    assert a.personalization != b.personalization
+    assert a.read(64) != b.read(64)
+
+
+def test_explicit_personalization_is_respected():
+    source = FakeSource(count_rate=2000.0)
+    generator = build(source, personalization=b'chosen-by-caller')
+    assert generator.personalization == b'chosen-by-caller'
+
+
+def test_default_personalization_survives_a_source_without_a_serial():
+    class Anonymous(FakeSource):
+        def serial(self):
+            raise RuntimeError('no serial on this transport')
+
+    generator = build(Anonymous(count_rate=2000.0), startup_samples=8)
+    assert b'unknown' in generator.personalization

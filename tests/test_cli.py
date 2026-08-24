@@ -22,7 +22,10 @@ def stub_device(monkeypatch):
     created = []
 
     def fake_open(args):
-        source = FakeSource(count_rate=3000.0)
+        # A distinct seed per open. Reusing one would make two consecutive
+        # runs replay an identical photon stream, which is not something a
+        # real detector can do and made test_gen_two_runs_differ flaky.
+        source = FakeSource(seed=1000 + len(created), count_rate=3000.0)
         created.append(source)
         return source
 
