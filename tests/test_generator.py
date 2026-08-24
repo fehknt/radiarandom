@@ -320,3 +320,96 @@ def test_default_personalization_survives_a_source_without_a_serial():
 
     generator = build(Anonymous(count_rate=2000.0), startup_samples=8)
     assert b'unknown' in generator.personalization
+
+
+# ------------------------------------------------ reservoir accounting
+
+
+def _bank(generator, want_bytes, limit=40000):
+    """Pump until the reserve holds at least want_bytes."""
+    generator.wait_for_startup()
+    for _ in range(limit):
+        generator.pump_once()
+        if generator.reservoir_bytes >= want_bytes:
+            return
+    raise AssertionError(
+        f'only banked {generator.reservoir_bytes} of {want_bytes} bytes')
+
+
+def test_the_reserve_accumulates_far_past_a_single_draw(fast_source):
+    """Idle time banks a real reserve, bounded by a stated capacity."""
+    generator = build(fast_source, startup_samples=16, reservoir_capacity=2048)
+    _bank(generator, 2048)
+    assert generator.reservoir_bytes == 2048
+    assert generator.reservoir_fraction == pytest.approx(1.0)
+
+
+def test_the_reserve_does_not_grow_without_bound(fast_source):
+    generator = build(fast_source, startup_samples=16, reservoir_capacity=512)
+    _bank(generator, 512)
+    for _ in range(500):
+        generator.pump_once()
+    assert generator.reservoir_bytes <= 512, 'capacity must be a real ceiling'
+
+
+def test_a_small_draw_costs_one_byte_not_a_whole_block(fast_source):
+    """A coin flip used to consume 320 banked bits and discard 31 of 32 bytes.
+
+    At ~20 bits/s that was sixteen seconds of detector time for eight bits of
+    output, and it is why auto-repeat looked like it hung: every click drained
+    a block, so the gauge read full one moment and empty the next.
+    """
+    generator = build(fast_source, startup_samples=16)
+    _bank(generator, 1024)
+    before = generator.reservoir_bytes
+    generator.physical_bytes(1)
+    assert generator.reservoir_bytes == before - 1
+
+    for _ in range(99):
+        generator.physical_bytes(1)
+    assert generator.reservoir_bytes == before - 100
+
+
+def test_banked_bytes_are_never_handed_out_twice(fast_source):
+    generator = build(fast_source, startup_samples=16)
+    _bank(generator, 1024)
+    drawn = [generator.physical_bytes(8) for _ in range(64)]
+    assert len(set(drawn)) == len(drawn)
+    assert all(len(d) == 8 for d in drawn)
+
+
+def test_physical_bytes_lengths_are_exact_across_block_boundaries(fast_source):
+    generator = build(fast_source, startup_samples=16)
+    _bank(generator, 2048)
+    for n in (1, 31, 32, 33, 64, 100, 257):
+        assert len(generator.physical_bytes(n)) == n
+    assert generator.physical_bytes(0) == b''
+
+
+def test_physical_block_is_a_full_block_from_the_reserve(fast_source):
+    generator = build(fast_source, startup_samples=16)
+    _bank(generator, 1024)
+    before = generator.reservoir_bytes
+    block = generator.physical_block()
+    assert len(block) == BLOCK_BYTES
+    assert generator.reservoir_bytes == before - BLOCK_BYTES
+
+
+def test_a_burst_of_draws_is_served_instantly_from_the_reserve(fast_source):
+    """The point of banking: a run of dice rolls must not wait on decay."""
+    import time as _time
+    generator = build(fast_source, startup_samples=16)
+    _bank(generator, 1024)
+    started = _time.perf_counter()
+    for _ in range(500):
+        generator.physical_bytes(1)
+    assert _time.perf_counter() - started < 1.0
+
+
+def test_readiness_estimates_are_sane(fast_source):
+    generator = build(fast_source, startup_samples=16)
+    _bank(generator, 1024)
+    assert generator.seconds_until(1) == 0.0
+    assert generator.seconds_until(generator.reservoir_bytes) == 0.0
+    assert generator.seconds_until(10 ** 7) > 0
+    assert generator.sustainable_draws_per_second(1) >         generator.sustainable_draws_per_second(32)

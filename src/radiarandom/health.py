@@ -85,6 +85,34 @@ RATE_WINDOW_S = 60.0
 #: looking for a detector that has broken, not for weather.
 RATE_SIGMA = 8.0
 
+#: Weight given to the newest window when updating the rolling baselines.
+#:
+#: The baselines have to track the environment or they become the "warns
+#: forever" bug again the first time anything legitimately changes -- a source
+#: is added or removed, the detector is moved, the room warms up. But they must
+#: not track so eagerly that a slow degradation is followed all the way down
+#: and never reported. Two timescales resolve it: a *fast* window is compared
+#: against a *slowly* adapting reference, so an abrupt change raises a warning
+#: for as long as the transition lasts and then settles.
+#:
+#: What deliberately does NOT adapt is the boiling-frog guard: the proportion
+#: hard ceiling, and the entropy budget, which is recomputed from the live
+#: spectrum and simply credits less when the detector gets worse.
+BASELINE_BLEND = 0.25
+
+#: Photons between re-derivations of the proportion cutoff.
+RECALIBRATE_PHOTONS = 4096
+
+#: Blend used for the window that actually triggered a shape warning.
+#:
+#: Once the transition has been reported there is no value in reporting it
+#: again for the next half hour, so the baseline jumps most of the way to the
+#: new shape. The effect is: warn while it changes, then settle. Slow drift
+#: still only gets BASELINE_BLEND, so it is tracked without being announced --
+#: and the entropy budget, which reprices from the live spectrum, is what
+#: protects against being boiled slowly.
+BASELINE_BLEND_ON_CHANGE = 0.6
+
 #: Coarse bins for the spectral-shape test. Fine enough to notice a collapse,
 #: coarse enough that ordinary gain drift does not trip it.
 SHAPE_BINS = 32
@@ -184,6 +212,10 @@ class HealthMonitor:
         self.startup_samples = startup_samples
 
         self.assumed_proportion_cutoff = proportion_cutoff(h_per_photon, n_channels=n_symbols)
+        #: Non-adaptive failure threshold. Nothing re-calibration does can move
+        #: this, so a stuck ADC is caught however peaky the baseline becomes.
+        self.proportion_ceiling = int(PROPORTION_HARD_CEILING * PROPORTION_WINDOW)
+        self._proportion_warned = False
         # While calibrating we do not yet know the detector's real pulse-height
         # distribution, so the tight assumed cutoff would fire on any legitimate
         # peak -- a check source, say. During this phase only the hard ceiling
@@ -248,6 +280,11 @@ class HealthMonitor:
         self._calibration = [0] * SHAPE_BINS
         self._calibration_total = 0
         self._calibration_channels: collections.Counter = collections.Counter()
+        # Decaying channel histogram driving periodic cutoff re-derivation.
+        self._rolling_channels: dict = {}
+        self._rolling_total = 0.0
+        self._photons_since_recalibration = 0
+        self.recalibrations = 0
         self._recent = [0] * SHAPE_BINS
         self._recent_total = 0
 
@@ -322,13 +359,37 @@ class HealthMonitor:
             if len(self._window) < self._window.maxlen:
                 continue
             channel_count = self._window_counts[channel]
-            if channel_count >= self.proportion_cutoff:
+
+            # Two thresholds, and the distinction matters. Exceeding the hard
+            # ceiling means one channel is taking half of everything, which no
+            # legitimate source does -- that is a stuck ADC and it is fatal.
+            # Exceeding the *adaptive* cutoff just means the spectrum is
+            # peakier than the current baseline expects, which is exactly what
+            # happens when someone puts a check source next to the detector.
+            # Failing there would reject the configuration the documentation
+            # recommends, so it warns and re-derives instead. The entropy
+            # budget handles the peak quantitatively: a narrower spectrum is
+            # priced lower, so output slows rather than becoming overstated.
+            if channel_count >= self.proportion_ceiling:
                 events.append(self._fail(
                     'proportion',
                     f'channel {channel} accounts for {channel_count} of the last '
-                    f'{PROPORTION_WINDOW} photons (cutoff {self.proportion_cutoff})',
+                    f'{PROPORTION_WINDOW} photons, past the hard ceiling of '
+                    f'{self.proportion_ceiling}; detector appears stuck',
                 ))
                 return events
+
+            if channel_count >= self.proportion_cutoff and not self._proportion_warned:
+                self._proportion_warned = True
+                events.append(self._warn(
+                    'proportion',
+                    f'channel {channel} accounts for {channel_count} of the last '
+                    f'{PROPORTION_WINDOW} photons (cutoff {self.proportion_cutoff}); '
+                    f're-deriving against the current spectrum'))
+                events.extend(self._derive_proportion_cutoff(
+                    self._rolling_channels or self._window_counts,
+                    self._rolling_total or float(len(self._window)),
+                    'excursion'))
         return events
 
     def _repetition_test(self, batch: Batch) -> list[HealthEvent]:
@@ -397,7 +458,7 @@ class HealthMonitor:
         for channel in channels:
             self._recent[min(SHAPE_BINS - 1, channel // per_bin)] += 1
         self._recent_total += len(channels)
-        return []
+        return self._track_rolling_spectrum(channels)
 
     def _recalibrate_proportion(self) -> list[HealthEvent]:
         """Retune the proportion cutoff to the spectrum actually observed.
@@ -421,10 +482,14 @@ class HealthMonitor:
         The cutoff is only ever loosened, never tightened, so a quiet spectrum
         cannot make the test hair-trigger.
         """
-        total = self._calibration_total
-        if total < 64 or not self._calibration_channels:
+        return self._derive_proportion_cutoff(
+            self._calibration_channels, self._calibration_total, 'calibration')
+
+    def _derive_proportion_cutoff(self, counts, total: float,
+                                  reason: str) -> list:
+        if total < 64 or not counts:
             return []
-        p_hat = max(self._calibration_channels.values()) / total
+        p_hat = max(counts.values()) / total
         # 99% upper bound on the busiest channel's share.
         margin = 2.576 * math.sqrt(p_hat * (1.0 - p_hat) / max(1, total - 1))
         p_upper = min(1.0, p_hat + margin)
@@ -441,23 +506,60 @@ class HealthMonitor:
         previous = self.proportion_cutoff
         self.proportion_cutoff = chosen
         self.proportion_cutoff_origin = (
-            f'calibrated on {total} photons (busiest channel {p_hat:.1%})')
+            f'{reason} on {total:.0f} photons (busiest channel {p_hat:.1%})')
+        if chosen == previous:
+            return []
+        self.recalibrations += 1
+        self._proportion_warned = False
         event = HealthEvent(
             'proportion', 'info',
-            f'proportion cutoff set to {chosen} of {PROPORTION_WINDOW} '
-            f'(assumed {self.assumed_proportion_cutoff}, fitted {fitted}, '
-            f'ceiling {ceiling}; busiest channel holds {p_hat:.1%}, '
-            f'was {previous} during calibration)')
+            f'proportion cutoff {previous} -> {chosen} of {PROPORTION_WINDOW} '
+            f'after {reason} (assumed {self.assumed_proportion_cutoff}, '
+            f'fitted {fitted}, ceiling {ceiling}; busiest channel {p_hat:.1%})')
         self.events.append(event)
         return [event]
+
+    def _track_rolling_spectrum(self, channels) -> list:
+        """Keep a decaying channel histogram and re-derive the cutoff from it.
+
+        Without this the cutoff is fixed at start-up forever: add a check
+        source an hour in and the proportion test rejects a detector that is
+        working better than when it was calibrated.
+        """
+        for channel in channels:
+            self._rolling_channels[channel] = self._rolling_channels.get(channel, 0.0) + 1.0
+        self._rolling_total += len(channels)
+        self._photons_since_recalibration += len(channels)
+        if self._photons_since_recalibration < RECALIBRATE_PHOTONS:
+            return []
+        self._photons_since_recalibration = 0
+        events = self._derive_proportion_cutoff(
+            self._rolling_channels, self._rolling_total, 're-calibration')
+        # Forget slowly so the histogram keeps following the environment.
+        factor = 1.0 - BASELINE_BLEND
+        self._rolling_channels = {c: v * factor
+                                  for c, v in self._rolling_channels.items() if v * factor > 1e-6}
+        self._rolling_total *= factor
+        return events
 
     def _check_shape(self) -> list[HealthEvent]:
         if self._reference_shape is None or self._recent_total < 4096:
             return []
         chi2, dof = self._chi_square(self._recent, self._reference_shape,
                                      self._recent_total)
+        observed = [count / self._recent_total for count in self._recent]
         self._recent = [0] * SHAPE_BINS
         self._recent_total = 0
+
+        drifted = dof >= 4 and chi2 > 20.0 * dof
+        # Track the environment. A step change -- a source arriving, the
+        # detector moving -- is reported once and then absorbed, rather than
+        # nagging for the rest of the session.
+        blend = BASELINE_BLEND_ON_CHANGE if drifted else BASELINE_BLEND
+        self._reference_shape = [
+            (1.0 - blend) * ref + blend * obs
+            for ref, obs in zip(self._reference_shape, observed)]
+
         if dof < 4:
             return []
         # Deliberately loose: we are looking for a collapsed spectrum, not for
@@ -517,7 +619,17 @@ class HealthMonitor:
         if sigma <= 0:
             return []
         z = (observed - expected) / sigma
-        if abs(z) > RATE_SIGMA:
+
+        # Adapt toward what the detector is actually doing. Moving it, or
+        # adding a source, legitimately changes the rate; a baseline frozen at
+        # start-up would warn about that for the rest of the run. Excursions
+        # adapt more slowly, so a genuine collapse is reported for several
+        # windows before the baseline concedes.
+        excursion = abs(z) > RATE_SIGMA
+        blend = BASELINE_BLEND * (0.25 if excursion else 1.0)
+        self.expected_count_rate = (1.0 - blend) * expected + blend * observed
+
+        if excursion:
             return [self._warn(
                 'rate',
                 f'count rate over the last {elapsed:.0f}s was {observed:.2f}/s '
@@ -600,6 +712,8 @@ class HealthMonitor:
             'proportion_cutoff_origin': self.proportion_cutoff_origin,
             'proportion_window': PROPORTION_WINDOW,
             'repeat_cutoff': self.repeat_cutoff,
+            'recalibrations': self.recalibrations,
+            'expected_count_rate': self.expected_count_rate,
             'rct_cutoff': self.rct_cutoff,
             'events': [str(event) for event in self.events[-20:]],
         }

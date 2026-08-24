@@ -49,6 +49,20 @@ BLOCK_BYTES = BLOCK_BITS // 8
 #: Banked entropy needed to release one block.
 BLOCK_COST_BITS = BLOCK_BITS + FULL_ENTROPY_MARGIN_BITS
 
+#: Most min-entropy the pool can actually hold, in bits.
+#:
+#: The pool is a running HMAC-SHA-512, so its accumulated state *is* a 512-bit
+#: chaining value. It cannot carry more entropy than that no matter how much is
+#: absorbed, and an earlier version of this class counted credited bits without
+#: any limit -- it was observed claiming 2240 banked bits in a 512-bit state,
+#: which is simply not true. Anything absorbed beyond the cap still stirs the
+#: state but earns no credit.
+#:
+#: Banking more than this is the reservoir's job (see
+#: :class:`radiarandom.generator.Generator`): blocks are *extracted* into a
+#: buffer, where each one is genuinely 256 independent bits.
+STATE_CAPACITY_BITS = 512
+
 
 def serialize_batch(batch: Batch) -> bytes:
     """Canonical byte encoding of one observation.
@@ -87,17 +101,30 @@ class EntropyPool:
         self._absorbed = 0
         self._blocks_out = 0
         self._total_bits_banked = 0.0
+        self._bits_dropped = 0.0
 
     # ---------------------------------------------------------------- absorb
 
-    def absorb(self, data: bytes, entropy_bits: float = 0.0) -> None:
-        """Mix ``data`` into the pool, crediting it with ``entropy_bits``."""
+    def absorb(self, data: bytes, entropy_bits: float = 0.0) -> float:
+        """Mix ``data`` into the pool, crediting it with ``entropy_bits``.
+
+        Credit saturates at :data:`STATE_CAPACITY_BITS`, because the pool
+        cannot hold more entropy than its 512-bit state. Returns the credit
+        actually taken, so callers can tell when entropy is being dropped on
+        the floor and extract more eagerly.
+        """
         self._mac.update(struct.pack('<I', len(data)))
         self._mac.update(data)
         self._absorbed += len(data)
-        if entropy_bits > 0:
-            self._bits += entropy_bits
-            self._total_bits_banked += entropy_bits
+        if entropy_bits <= 0:
+            return 0.0
+        headroom = max(0.0, STATE_CAPACITY_BITS - self._bits)
+        credited = min(entropy_bits, headroom)
+        if credited < entropy_bits:
+            self._bits_dropped += entropy_bits - credited
+        self._bits += credited
+        self._total_bits_banked += credited
+        return credited
 
     def absorb_unaccounted(self, data: bytes) -> None:
         """Mix in data that gets no entropy credit (host jitter, counters)."""
@@ -111,7 +138,21 @@ class EntropyPool:
 
     @property
     def blocks_available(self) -> int:
+        """Blocks the pool could release right now.
+
+        Capped by the state size, so this is 0 or 1 in practice. Banking more
+        than one draw is the reservoir's job, not the pool's.
+        """
         return int(self._bits // BLOCK_COST_BITS)
+
+    @property
+    def capacity_bits(self) -> float:
+        return float(STATE_CAPACITY_BITS)
+
+    @property
+    def fill_fraction(self) -> float:
+        """How full the pool is toward releasing its next block, 0..1."""
+        return min(1.0, self._bits / BLOCK_COST_BITS)
 
     def ready(self) -> bool:
         return self._bits >= BLOCK_COST_BITS
@@ -142,6 +183,8 @@ class EntropyPool:
             'total_bits_banked': self._total_bits_banked,
             'bytes_absorbed': self._absorbed,
             'blocks_released': self._blocks_out,
+            'bits_dropped_at_capacity': self._bits_dropped,
+            'capacity_bits': STATE_CAPACITY_BITS,
         }
 
 

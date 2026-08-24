@@ -8,6 +8,7 @@ entering the Tk main loop. Skipped where there is no Tk or no display.
 from __future__ import annotations
 
 import queue
+import threading
 import time
 
 import pytest
@@ -300,22 +301,167 @@ def test_health_failure_is_surfaced_in_the_status_line(app):
     app.worker.events.put(('metrics', {
         'count_rate': 16.0, 'entropy_rate': 20.0,
         'healthy': False, 'failure': 'proportion: channel 25 dominates',
-        'pool_fraction': 0.5,
     }))
     app._pump_events()
     assert 'HEALTH FAILURE' in app.metrics_var.get()
 
 
+HEALTHY_METRICS = {
+    'count_rate': 16.2, 'entropy_rate': 21.0, 'healthy': True, 'failure': None,
+    'reservoir_bytes': 1024, 'reservoir_capacity': 4096,
+    'reservoir_fraction': 0.25, 'pool_fill': 0.5, 'cost_bits_per_byte': 10.0,
+    'drbg_seeded': True, 'seconds_since_reseed': 4.0, 'reseeds': 1,
+}
+
+
 def test_metrics_are_rendered_when_healthy(app):
-    app.worker.events.put(('metrics', {
-        'count_rate': 16.2, 'entropy_rate': 21.0,
-        'healthy': True, 'failure': None, 'pool_fraction': 1.0,
-    }))
+    app.worker.events.put(('metrics', dict(HEALTHY_METRICS)))
     app._pump_events()
     text = app.metrics_var.get()
     assert '16.2 counts/s' in text and '21.0 bits/s' in text
+    assert 'reserve 25%' in text and '1024/4096' in text
+
+
+def test_readiness_line_counts_banked_draws_in_physical_mode(app):
+    app.physical_var.set(True)
+    app._apply_preset(1, 6, None)
+    app.worker.events.put(('metrics', dict(HEALTHY_METRICS)))
+    app._pump_events()
+    ready = app.ready_var.get()
+    assert 'ready now' in ready
+    assert 'draws banked' in ready
+    assert 'sustains' in ready
+
+
+def test_readiness_line_estimates_a_wait_when_the_reserve_is_short(app):
+    app.physical_var.set(True)
+    app.min_var.set('1'); app.max_var.set('100'); app.count_var.set('500')
+    metrics = dict(HEALTHY_METRICS, reservoir_bytes=0, reservoir_fraction=0.0)
+    app.worker.events.put(('metrics', metrics))
+    app._pump_events()
+    assert 'needs 500 B' in app.ready_var.get()
+    assert 's' in app.ready_var.get()
+
+
+def test_readiness_line_describes_the_drbg_in_fast_mode(app):
+    app.physical_var.set(False)
+    app.worker.events.put(('metrics', dict(HEALTHY_METRICS)))
+    app._pump_events()
+    ready = app.ready_var.get()
+    assert 'DRBG ready' in ready and 'unlimited' in ready
+
+
+def test_readiness_warns_when_auto_repeat_outruns_the_detector(app):
+    app.physical_var.set(True)
+    app.auto_var.set(True)
+    app.rate_var.set(20.0)
+    app.min_var.set('1'); app.max_var.set('1000000000'); app.count_var.set('50')
+    app.worker.events.put(('metrics', dict(HEALTHY_METRICS)))
+    app._pump_events()
+    assert 'will throttle' in app.ready_var.get()
 
 
 def test_closing_stops_the_worker(app):
     app._on_close()
     assert app.worker.stopped
+
+
+# ------------------------------------------------- worker status publishing
+
+
+class StubPool:
+    entropy_bits = 160.0
+    fill_fraction = 0.5
+    blocks_available = 0
+    capacity_bits = 512.0
+
+
+class StubMonitor:
+    failed = False
+    failure_reason = None
+
+
+class StubGenerator:
+    """Enough of a Generator for _emit_status, with a draw that blocks."""
+
+    def __init__(self, block_for: float = 0.0) -> None:
+        self.pool = StubPool()
+        self.monitor = StubMonitor()
+        self.count_rate = 16.0
+        self.entropy_rate_bits_per_s = 20.0
+        self.reservoir_bytes = 1024
+        self.reservoir_capacity = 4096
+        self.reservoir_fraction = 0.25
+        self._block_for = block_for
+        self.draws = 0
+
+    def stats(self) -> dict:
+        return {'drbg': {'seconds_since_reseed': 3.0, 'reseeds': 2}}
+
+    def physical_bytes(self, n: int) -> bytes:
+        self.draws += 1
+        time.sleep(self._block_for)
+        return b'\x00' * n
+
+    def read(self, n: int) -> bytes:
+        return self.physical_bytes(n)
+
+    def stop(self) -> None:
+        pass
+
+
+def test_metrics_keep_arriving_while_a_draw_is_blocked(monkeypatch):
+    """The reported bug: clicking Generate froze the entropy counter.
+
+    Status used to be emitted from the same loop that executes draws, so a
+    physical draw -- ten to twenty seconds on real hardware -- stopped the count
+    rate and the pool gauge dead, precisely while the user was waiting on them.
+    """
+    monkeypatch.setattr(gui, 'STATUS_INTERVAL_S', 0.05)
+    worker = gui._Worker(None, 0)
+    worker._generator = StubGenerator(block_for=1.0)
+    worker._start_status_thread()
+    try:
+        worker.commands.put(('draw', {'low': 1, 'high': 6, 'count': 1,
+                                      'physical': True}))
+        serving = threading.Thread(target=worker._serve, daemon=True)
+        serving.start()
+
+        # While the draw is blocked, metrics must still be published.
+        time.sleep(0.6)
+        metrics = [k for k, _ in list(worker.events.queue) if k == 'metrics']
+        assert len(metrics) >= 3, f'status froze during the draw: {metrics}'
+
+        serving.join(timeout=5)
+    finally:
+        worker.stop()
+
+
+def test_status_thread_stops_with_the_worker(monkeypatch):
+    monkeypatch.setattr(gui, 'STATUS_INTERVAL_S', 0.02)
+    worker = gui._Worker(None, 0)
+    worker._generator = StubGenerator()
+    worker._start_status_thread()
+    worker.stop()
+    worker._status_thread.join(timeout=2)
+    assert not worker._status_thread.is_alive()
+
+
+def test_emit_status_is_a_no_op_before_the_generator_exists():
+    worker = gui._Worker(None, 0)
+    worker._emit_status()
+    assert worker.events.empty()
+
+
+def test_emit_status_reports_reserve_and_readiness():
+    worker = gui._Worker(None, 0)
+    worker._generator = StubGenerator()
+    worker._emit_status()
+    kind, payload = worker.events.get_nowait()
+    assert kind == 'metrics'
+    assert payload['healthy'] is True
+    assert payload['reservoir_bytes'] == 1024
+    assert payload['reservoir_capacity'] == 4096
+    assert 0.0 <= payload['reservoir_fraction'] <= 1.0
+    assert payload['cost_bits_per_byte'] > 0
+    assert payload['drbg_seeded'] is True

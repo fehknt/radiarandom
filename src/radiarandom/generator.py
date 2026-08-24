@@ -47,6 +47,14 @@ RESEED_BYTES = 1 << 20
 #: Batches between recomputations of the entropy assessment.
 ASSESSMENT_REFRESH_BATCHES = 64
 
+#: Default size of the full-entropy reserve, in bytes.
+#:
+#: Large but deliberately finite. The point of a reserve is to absorb bursts --
+#: a run of dice rolls, a handful of seeds -- not to accumulate forever, and an
+#: unbounded counter would misreport how much is really available. 4 KiB is
+#: about 4000 small draws, and fills in roughly half an hour at 20 bits/s.
+RESERVOIR_CAPACITY_BYTES = 4096
+
 
 class GeneratorError(RuntimeError):
     pass
@@ -69,6 +77,7 @@ class Generator:
         safety_factor: float = entropy_mod.DEFAULT_SAFETY_FACTOR,
         h_channel: float = entropy_mod.DEFAULT_H_CHANNEL,
         personalization: Optional[bytes] = None,
+        reservoir_capacity: int = RESERVOIR_CAPACITY_BYTES,
     ) -> None:
         self.source = source
         self.use_live_estimate = use_live_estimate
@@ -118,6 +127,11 @@ class Generator:
         self._last_credit_monotonic: Optional[float] = None
         self._last_rate_monotonic: Optional[float] = None
         self._last_device_seconds: Optional[int] = None
+        # Conditioned full-entropy bytes, banked and ready to hand out. Each
+        # byte is used exactly once. This is the real reserve; the pool behind
+        # it can only hold 512 bits.
+        self.reservoir_capacity = max(BLOCK_BYTES, int(reservoir_capacity))
+        self._reservoir = bytearray()
 
     @staticmethod
     def _default_personalization(source) -> bytes:
@@ -189,6 +203,9 @@ class Generator:
             self._bits_credited += bits
 
         self.pool.absorb(serialize_batch(batch), bits)
+        # Drain promptly: the pool saturates at 512 bits, so anything left
+        # sitting in it once it is full is simply discarded.
+        self._fill_reservoir()
 
     def _refresh_assessment(self) -> None:
         """Recompute the budget from the measured rate and spectrum.
@@ -321,45 +338,117 @@ class Generator:
 
     # ------------------------------------------------------- physical output
 
-    def _try_extract(self) -> Optional[bytes]:
-        """Take a block if one is ready. Atomic against the pump thread."""
-        with self._lock:
-            if not self.pool.ready():
-                return None
-            self._blocks_released += 1
-            return self.pool.extract_block()
+    # ------------------------------------------------------------- reservoir
 
-    def physical_block(self, timeout: Optional[float] = None) -> bytes:
-        """Return one 256-bit full-entropy block, waiting for the detector.
+    def _fill_reservoir(self) -> int:
+        """Drain the pool into the reservoir. Caller holds the lock.
 
-        Safe whether or not a pump thread is running: the readiness check and
-        the extraction happen together under the lock, so two callers can never
-        both believe the same block is theirs.
+        The pool itself is a 512-bit HMAC state and cannot bank more than that,
+        so leaving entropy sitting in it just throws the surplus away once it
+        saturates. Extracting eagerly into a buffer of already-conditioned
+        blocks is what lets the generator actually accumulate a reserve, and
+        every byte in that buffer is genuine full-entropy output rather than a
+        claim about a hash state.
         """
+        released = 0
+        while self.pool.ready() and len(self._reservoir) + BLOCK_BYTES <= self.reservoir_capacity:
+            self._reservoir += self.pool.extract_block()
+            self._blocks_released += 1
+            released += 1
+        return released
+
+    def _take_reservoir(self, n: int) -> bytes:
+        """Pop up to ``n`` bytes. Never blocks, never returns a byte twice."""
+        if n <= 0:
+            return b''
+        with self._lock:
+            take = min(n, len(self._reservoir))
+            if not take:
+                return b''
+            out = bytes(self._reservoir[:take])
+            del self._reservoir[:take]
+            return out
+
+    @property
+    def reservoir_bytes(self) -> int:
+        """Full-entropy bytes banked and ready to hand out immediately."""
+        with self._lock:
+            return len(self._reservoir)
+
+    @property
+    def reservoir_fraction(self) -> float:
+        """How full the reserve is, 0..1, against its configured capacity."""
+        if self.reservoir_capacity <= 0:
+            return 0.0
+        return min(1.0, self.reservoir_bytes / self.reservoir_capacity)
+
+    def seconds_until(self, n_bytes: int) -> float:
+        """Estimated wait before ``n_bytes`` of physical output are available.
+
+        Zero when the reserve already covers it. Uses the current banked rate,
+        so it tracks the detector rather than a nominal figure.
+        """
+        missing = max(0, n_bytes - self.reservoir_bytes)
+        if missing == 0:
+            return 0.0
+        rate = self.entropy_rate_bits_per_s
+        if rate <= 0:
+            return float('inf')
+        # Each output byte costs BLOCK_COST_BITS/BLOCK_BYTES banked bits.
+        cost_per_byte = BLOCK_COST_BITS / BLOCK_BYTES
+        deficit_bits = missing * cost_per_byte - self.pool.entropy_bits
+        return max(0.0, deficit_bits) / rate
+
+    def sustainable_draws_per_second(self, bytes_per_draw: int) -> float:
+        """How often a draw of this size can be served indefinitely."""
+        if bytes_per_draw <= 0:
+            return float('inf')
+        rate = self.entropy_rate_bits_per_s
+        cost_per_byte = BLOCK_COST_BITS / BLOCK_BYTES
+        return rate / (bytes_per_draw * cost_per_byte)
+
+    # ------------------------------------------------------- physical output
+
+    def physical_bytes(self, n: int, timeout: Optional[float] = None) -> bytes:
+        """Exactly ``n`` bytes of full-entropy output, waiting if necessary.
+
+        Served from the reservoir a byte at a time. This used to take a whole
+        32-byte block per call and discard the remainder, so a one-byte draw --
+        a coin flip, a d6 -- cost the full 320 banked bits and, at ~20 bits/s,
+        sixteen seconds of detector time for eight bits of output. That also
+        made auto-repeat appear to hang: every click drained a block, so the
+        gauge read full one moment and empty the next.
+        """
+        if n <= 0:
+            return b''
         self._require_healthy()
         deadline = None if timeout is None else time.perf_counter() + timeout
+
+        out = bytearray()
         while True:
-            block = self._try_extract()
-            if block is not None:
-                return block
+            out += self._take_reservoir(n - len(out))
+            if len(out) >= n:
+                return bytes(out)
             if self._stop.is_set():
                 raise GeneratorError('generator stopped while waiting for entropy')
             if deadline is not None and time.perf_counter() > deadline:
                 raise TimeoutError(
-                    f'timed out waiting for entropy; pool holds '
-                    f'{self.pool.entropy_bits:.0f} of {BLOCK_COST_BITS} bits')
+                    f'timed out waiting for entropy; {len(out)}/{n} bytes served, '
+                    f'reserve holds {self.reservoir_bytes}')
             if self._thread is None:
                 self.pump_once()
             time.sleep(self.source.poll_interval)
             if self.monitor.failed:
                 raise HealthFailure(self.monitor.failure_reason or 'health test failed')
 
-    def physical_bytes(self, n: int, timeout: Optional[float] = None) -> bytes:
-        """Exactly ``n`` bytes of full-entropy output. Rate-limited by decay."""
-        out = bytearray()
-        while len(out) < n:
-            out += self.physical_block(timeout=timeout)
-        return bytes(out[:n])
+    def physical_block(self, timeout: Optional[float] = None) -> bytes:
+        """One 256-bit full-entropy block, for seeding.
+
+        Every byte in the reservoir was produced by the vetted conditioner and
+        is handed out exactly once, so 32 consecutive bytes are as good a seed
+        as a freshly extracted block.
+        """
+        return self.physical_bytes(BLOCK_BYTES, timeout=timeout)
 
     def physical_stream(self, timeout: Optional[float] = None) -> Iterator[bytes]:
         while not self._stop.is_set():
@@ -379,9 +468,9 @@ class Generator:
     def _maybe_reseed(self) -> None:
         """Fold fresh detector entropy into the DRBG when any is available.
 
-        Opportunistic by default: if the detector has not finished another
-        block we carry on generating rather than stalling, because the DRBG is
-        still secure. Only the hard SP 800-90A reseed interval forces a wait.
+        Opportunistic by default: if the reserve is short we carry on
+        generating rather than stalling, because the DRBG is still secure. Only
+        the hard SP 800-90A reseed interval forces a wait.
         """
         drbg = self._drbg
         if drbg is None:
@@ -396,10 +485,14 @@ class Generator:
         )
         if not due:
             return
-        block = self._try_extract()
-        if block is not None:
+        block = self._take_reservoir(BLOCK_BYTES)
+        if len(block) == BLOCK_BYTES:
             drbg.reseed(block)
             drbg.bytes_generated = 0
+        elif block:
+            # Not enough for a reseed; put it back rather than waste it.
+            with self._lock:
+                self._reservoir[:0] = block
 
     def read(self, n: int, timeout: Optional[float] = None) -> bytes:
         """Return ``n`` bytes of DRBG output, reseeded from the detector."""
@@ -439,6 +532,9 @@ class Generator:
             'entropy_rate_bits_per_s': self.entropy_rate_bits_per_s,
             'bits_credited': self._bits_credited,
             'blocks_released': self._blocks_released,
+            'reservoir_bytes': self.reservoir_bytes,
+            'reservoir_capacity': self.reservoir_capacity,
+            'reservoir_fraction': self.reservoir_fraction,
             'pool': self.pool.stats(),
             'drbg': self._drbg.stats() if self._drbg else None,
             'health': self.monitor.status(),

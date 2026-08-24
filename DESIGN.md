@@ -481,6 +481,62 @@ insurance — an attacker must defeat both. A single detector XORed against
 itself buys none of that, since one failing detector fails both halves at once,
 while paying half the rate and a third of the entropy for the privilege.
 
+### Banking: the pool cannot hold what the reservoir can
+
+The pool is a running HMAC-SHA-512, so its accumulated state *is* a 512-bit
+chaining value and it cannot carry more than 512 bits of min-entropy no matter
+how much is absorbed. An earlier version counted credited bits without any
+limit and was observed claiming 2240 banked bits in a 512-bit state. That claim
+was simply false, and credit now saturates at the state size.
+
+Accumulating a real reserve is therefore a separate job. Blocks are *extracted*
+promptly into a bounded buffer -- 4 KiB by default -- where every byte is
+genuine conditioned output rather than a claim about a hash state. Draining
+eagerly also stops the pool from saturating and throwing the surplus away.
+
+The reserve is deliberately finite. Its purpose is to absorb bursts (a run of
+dice rolls, a handful of seeds), not to accumulate forever, and an unbounded
+counter would misreport how much is actually available.
+
+Serving small reads from the reserve matters more than it sounds. A one-byte
+draw used to take a whole 32-byte block and discard 31 bytes, so a coin flip
+cost the full 320 banked bits -- sixteen seconds of detector time at 20 bits/s
+for eight bits of output. It also made the GUI's auto-repeat look broken: every
+click drained a block, so the gauge read full one moment and empty the next.
+
+### Continuous re-calibration
+
+Every baseline adapts, because a fixed one is the "warns forever" bug waiting
+for the next legitimate change -- a source added or removed, the detector
+moved, the room warming up.
+
+* The **spectral baseline** blends each completed window into the reference.
+  A window that triggered a warning blends at 0.6 rather than 0.25: once the
+  transition has been reported there is nothing to gain from reporting it again
+  for the next half hour. Measured on a 300-channel shift: chi2 26426 -> 7302
+  -> 1428 over three windows, then silence.
+* The **proportion cutoff** is re-derived from a decaying channel histogram
+  every 4096 photons, and immediately on an excursion.
+* The **rate baseline** tracks the observed rate, more slowly during an
+  excursion so a genuine collapse is reported for several windows first.
+* The **live spectrum estimate** feeding the entropy budget decays with a
+  20-minute half-life, so the budget prices the detector as it is rather than
+  as it was averaged over the whole run.
+
+Adaptation must not be able to hide degradation, so two things never move:
+
+* the **proportion hard ceiling** -- one channel taking half the window is a
+  stuck ADC whatever the baseline has learned, and that stays fatal;
+* the **entropy budget**, which is recomputed from the live spectrum and simply
+  credits less as the detector gets worse. That is the real protection against
+  being boiled slowly: a degraded detector does not get waved through, it earns
+  less and the output rate falls.
+
+This is also why exceeding the *adaptive* cutoff is a warning rather than a
+failure. A check source legitimately puts 20% of counts in one channel; failing
+there would reject the configuration the documentation recommends, while the
+budget already prices the narrower spectrum correctly.
+
 ### Reseeding
 
 The mandatory reseed interval is 2²⁰ requests — loose on purpose. An earlier

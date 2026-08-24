@@ -335,7 +335,7 @@ def test_a_check_source_peak_does_not_halt_the_generator():
         monitor.observe(source_like_batch(seq))
         assert not monitor.failed, monitor.failure_reason
     assert monitor.started
-    assert 'calibrated' in monitor.proportion_cutoff_origin
+    assert 'busiest channel' in monitor.proportion_cutoff_origin
 
 
 def test_a_stuck_channel_is_still_caught_after_calibration():
@@ -367,3 +367,101 @@ def test_calibration_phase_still_catches_a_totally_stuck_detector():
         monitor.observe(batch(seq, [77] * rng.randint(30, 70)))
     assert monitor.failed
     assert 'proportion' in (monitor.failure_reason or ''), monitor.failure_reason
+
+
+# ------------------------------------------- continuous re-calibration
+
+
+def _stream(monitor, seq, n_batches, sampler, per_batch=40, monotonic=None):
+    """Feed the monitor a run of batches drawn from `sampler`."""
+    events = []
+    for _ in range(n_batches):
+        seq += 1
+        channels = sorted(sampler() for _ in range(per_batch))
+        t = None if monotonic is None else monotonic(seq)
+        events.extend(monitor.observe(batch(seq, channels, monotonic=t)))
+    return seq, events
+
+
+def test_the_proportion_cutoff_follows_a_source_arriving_mid_run():
+    """A source added an hour in must not be rejected by a start-up baseline.
+
+    The cutoff used to be derived once during calibration and then frozen, so
+    the very thing the docs recommend for raising the entropy rate would halt
+    the generator later on.
+    """
+    rng = random.Random(61)
+    monitor = health.HealthMonitor(h_per_photon=4.0, startup_samples=1024)
+    broad = lambda: int(rng.expovariate(1 / 200.0)) % 1024
+    seq, _ = _stream(monitor, 0, 120, broad)
+    assert not monitor.failed
+    quiet_cutoff = monitor.proportion_cutoff
+
+    # A source arrives: 20% of counts now land on one channel.
+    peaked = lambda: 25 if rng.random() < 0.20 else int(rng.expovariate(1 / 200.0)) % 1024
+    seq, _ = _stream(monitor, seq, 400, peaked)
+
+    assert not monitor.failed, monitor.failure_reason
+    assert monitor.proportion_cutoff > quiet_cutoff, 'cutoff should have widened'
+    assert monitor.recalibrations >= 1
+
+
+def test_recalibration_never_exceeds_the_hard_ceiling():
+    """Adaptation must not be able to disarm the test completely."""
+    rng = random.Random(63)
+    monitor = health.HealthMonitor(h_per_photon=4.0, startup_samples=64)
+    hot = lambda: 100 if rng.random() < 0.9 else rng.randrange(1024)
+    try:
+        _stream(monitor, 0, 400, hot)
+    except Exception:
+        pass
+    ceiling = int(health.PROPORTION_HARD_CEILING * health.PROPORTION_WINDOW)
+    assert monitor.proportion_cutoff <= ceiling
+
+
+def test_the_shape_baseline_stops_warning_once_a_change_settles():
+    """A step change warns during the transition, then goes quiet.
+
+    Measured trajectory when the spectrum shifts 300 channels: chi2 26426 ->
+    7302 -> 1428 over three windows, then silence. The point is that it stops.
+    """
+    rng = random.Random(65)
+    monitor = health.HealthMonitor(h_per_photon=4.0, startup_samples=0,
+                                   calibrate_photons=2048)
+    low = lambda: int(rng.expovariate(1 / 90.0)) % 1024
+    seq, _ = _stream(monitor, 0, 200, low)
+
+    high = lambda: 300 + int(rng.expovariate(1 / 90.0)) % 700
+    seq, during = _stream(monitor, seq, 300, high)
+    assert any(e.kind == 'shape' and e.severity == 'warning' for e in during),         'the transition itself must be reported'
+
+    # Give the baseline a few windows to absorb the change...
+    seq, _ = _stream(monitor, seq, 300, high)
+    # ...then it must be quiet for a sustained stretch.
+    seq, settled = _stream(monitor, seq, 400, high)
+    warnings = [e for e in settled if e.kind == 'shape' and e.severity == 'warning']
+    assert not warnings, f'still nagging after settling: {[str(w) for w in warnings]}'
+
+
+def test_the_rate_baseline_follows_a_legitimate_change():
+    rng = random.Random(67)
+    monitor = health.HealthMonitor(h_per_photon=4.0, startup_samples=0,
+                                   expected_count_rate=80.0)
+    src = lambda: int(rng.expovariate(1 / 90.0)) % 1024
+    clock = [0.0]
+
+    def advance(_seq):
+        clock[0] += 0.5
+        return clock[0]
+
+    # Sustained 40/s against an 80/s baseline: 20 batches of 20 per 10 s.
+    _stream(monitor, 0, 600, src, per_batch=20, monotonic=advance)
+    assert monitor.expected_count_rate < 80.0, 'baseline should have tracked down'
+    assert monitor.expected_count_rate > 20.0, 'but not overshoot'
+
+
+def test_status_reports_recalibration_activity():
+    monitor = health.HealthMonitor(h_per_photon=4.0, startup_samples=0)
+    status = monitor.status()
+    assert 'recalibrations' in status
+    assert 'expected_count_rate' in status

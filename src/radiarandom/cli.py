@@ -571,11 +571,11 @@ def cmd_raw(args) -> int:
                     }
                     jsonl.write(json.dumps(record, separators=(',', ':')))
                     jsonl.write('\n')
-                block = generator._try_extract()
-                while block is not None:
-                    physical.write(block)
-                    blocks += 1
-                    block = generator._try_extract()
+                banked = generator.reservoir_bytes
+                if banked >= BLOCK_BYTES:
+                    chunk = banked - (banked % BLOCK_BYTES)
+                    physical.write(generator.physical_bytes(chunk))
+                    blocks += chunk // BLOCK_BYTES
                 now = time.perf_counter()
                 if now - last_flush >= flush_interval:
                     jsonl.flush()

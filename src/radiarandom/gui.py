@@ -31,7 +31,7 @@ import time
 from typing import Optional
 
 from . import formats
-from .conditioner import BLOCK_COST_BITS
+from .conditioner import BLOCK_BYTES, BLOCK_COST_BITS
 from .device import DeviceNotFound, RadiaCodeSource, SourceError
 from .generator import Generator
 from .health import HealthFailure
@@ -50,6 +50,9 @@ MIN_RATE, MAX_RATE, DEFAULT_RATE = 0.2, 20.0, 2.0
 #: How often the GUI drains the worker's queue, in milliseconds.
 POLL_MS = 50
 
+#: How often the worker publishes count rate, entropy rate and pool level.
+STATUS_INTERVAL_S = 1.0
+
 
 class _Worker(threading.Thread):
     """Owns the detector. Everything device-shaped happens on this thread.
@@ -67,6 +70,7 @@ class _Worker(threading.Thread):
         self._stop = threading.Event()
         self._source: Optional[RadiaCodeSource] = None
         self._generator: Optional[Generator] = None
+        self._status_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------- lifecycle
 
@@ -120,27 +124,43 @@ class _Worker(threading.Thread):
         # From here the pump thread keeps the pool topped up, so a physical
         # draw can block on this thread without starving the device.
         generator.run_background()
+        self._start_status_thread()
         self.events.put(('ready', None))
+
+    def _start_status_thread(self) -> None:
+        """Publish metrics on their own thread, independent of draws.
+
+        These used to be emitted from the command loop, which meant they froze
+        for the entire duration of a draw. In DRBG mode that is imperceptible;
+        in physical mode a draw blocks for ten to twenty seconds, so the count
+        rate and -- worse -- the pool gauge stopped moving exactly while the
+        user was waiting on them and wanted to know how much longer.
+        """
+        def loop() -> None:
+            while not self._stop.wait(STATUS_INTERVAL_S):
+                try:
+                    self._emit_status()
+                except Exception:  # pragma: no cover - shutdown races
+                    return
+
+        self._status_thread = threading.Thread(
+            target=loop, daemon=True, name='radiarandom-gui-status')
+        self._status_thread.start()
 
     # -------------------------------------------------------------- commands
 
     def _serve(self) -> None:
-        last_status = 0.0
+        """Execute draw commands. Metrics are published elsewhere, on purpose:
+        a physical draw blocks this loop for seconds at a time."""
         while not self._stop.is_set():
             try:
                 kind, payload = self.commands.get(timeout=0.2)
             except queue.Empty:
-                kind, payload = None, None
-
+                continue
             if kind == 'quit':
                 return
             if kind == 'draw':
                 self._draw(payload)
-
-            now = time.perf_counter()
-            if now - last_status > 1.0:
-                last_status = now
-                self._emit_status()
 
     def _draw(self, request: dict) -> None:
         generator = self._generator
@@ -160,13 +180,24 @@ class _Worker(threading.Thread):
         generator = self._generator
         if generator is None:
             return
-        pool_bits = generator.pool.entropy_bits
+        drbg = generator.stats()['drbg']
         self.events.put(('metrics', {
             'count_rate': generator.count_rate,
             'entropy_rate': generator.entropy_rate_bits_per_s,
             'healthy': not generator.monitor.failed,
             'failure': generator.monitor.failure_reason,
-            'pool_fraction': min(1.0, pool_bits / BLOCK_COST_BITS),
+            # The reserve is the real measure of readiness: bounded, and every
+            # byte in it is conditioned output that can be handed out at once.
+            'reservoir_bytes': generator.reservoir_bytes,
+            'reservoir_capacity': generator.reservoir_capacity,
+            'reservoir_fraction': generator.reservoir_fraction,
+            # The pool behind it tops out at 512 bits, so its own fill level is
+            # only interesting while the reserve is empty.
+            'pool_fill': generator.pool.fill_fraction,
+            'cost_bits_per_byte': BLOCK_COST_BITS / BLOCK_BYTES,
+            'drbg_seeded': drbg is not None,
+            'seconds_since_reseed': (drbg or {}).get('seconds_since_reseed'),
+            'reseeds': (drbg or {}).get('reseeds', 0),
         }))
 
 
@@ -190,6 +221,7 @@ class RandomApp:
         self._labels: Optional[tuple] = None
         self._history: list = []
         self._identity = ''
+        self._metrics: dict = {}
 
         self.worker = _Worker(serial, startup_samples)
 
@@ -211,6 +243,9 @@ class RandomApp:
         ttk.Label(top, textvariable=self.status_var, anchor='w').pack(fill='x')
         self.metrics_var = tk.StringVar(value='')
         ttk.Label(top, textvariable=self.metrics_var, anchor='w',
+                  foreground='#666').pack(fill='x')
+        self.ready_var = tk.StringVar(value='')
+        ttk.Label(top, textvariable=self.ready_var, anchor='w',
                   foreground='#666').pack(fill='x')
         self.progress = ttk.Progressbar(top, mode='determinate', maximum=1000)
         self.progress.pack(fill='x', pady=(6, 0))
@@ -429,19 +464,78 @@ class RandomApp:
             pass
         self.root.after(POLL_MS, self._pump_events)
 
+    def _draw_bytes(self) -> int:
+        """Bytes one draw of the current range needs, at minimum."""
+        try:
+            low, high = int(self.min_var.get()), int(self.max_var.get())
+            count = int(self.count_var.get())
+        except (ValueError, self.tk.TclError):
+            return 1
+        if high < low or count < 1:
+            return 1
+        return formats.bytes_needed_for(high - low + 1) * count
+
     def _render_metrics(self, m: dict) -> None:
-        if not m['healthy']:
-            self.metrics_var.set(f'HEALTH FAILURE — {m["failure"]}')
+        self._metrics = m
+        if not m.get('healthy', True):
+            self.metrics_var.set(f'HEALTH FAILURE — {m.get("failure")}')
+            self.ready_var.set('')
             return
-        rate = m['count_rate'] or 0.0
-        bits = m['entropy_rate'] or 0.0
-        pool = m['pool_fraction']
-        text = f'{rate:.1f} counts/s · {bits:.1f} bits/s entropy'
-        if self.physical_var.get():
-            text += f' · pool {pool * 100:.0f}%'
-        self.metrics_var.set(text)
+
+        rate = m.get('count_rate') or 0.0
+        bits = m.get('entropy_rate') or 0.0
+        banked = m.get('reservoir_bytes', 0)
+        capacity = m.get('reservoir_capacity', 1)
+        fraction = m.get('reservoir_fraction', 0.0)
+
+        self.metrics_var.set(
+            f'{rate:.1f} counts/s · {bits:.1f} bits/s · '
+            f'reserve {fraction * 100:.0f}% ({banked}/{capacity} B)')
+        self.ready_var.set(self._readiness_text(m, banked, bits))
+
         if self._ready:
-            self.progress['value'] = 1000 * pool if self.physical_var.get() else 1000
+            # The bar always shows the reserve against its real capacity. When
+            # the reserve is empty it falls back to the pool's progress toward
+            # the first block, so it still moves while you wait.
+            value = fraction if banked else m.get('pool_fill', 0.0) / capacity * BLOCK_BYTES
+            self.progress['value'] = 1000 * min(1.0, max(0.0, value))
+
+    def _readiness_text(self, m: dict, banked: int, bits: float) -> str:
+        """What the reserve means for the draw that is actually configured."""
+        need = self._draw_bytes()
+        cost = m.get('cost_bits_per_byte', BLOCK_COST_BITS / BLOCK_BYTES)
+
+        if not self.physical_var.get():
+            if not m.get('drbg_seeded'):
+                return f'DRBG not seeded yet — needs {2 * BLOCK_BYTES} B of reserve'
+            since = m.get('seconds_since_reseed')
+            when = f'{since:.0f}s ago' if since is not None else 'not yet'
+            return (f'DRBG ready — unlimited draws · reseeded {when} · '
+                    f'{m.get("reseeds", 0)} reseeds')
+
+        draws = banked // max(1, need)
+        if banked >= need:
+            text = f'ready now — {draws} draw{"s" if draws != 1 else ""} banked ({need} B each)'
+        else:
+            wait = (need - banked) * cost / bits if bits > 0 else float('inf')
+            wait_text = f'{wait:.0f}s' if wait < 3600 else 'a long time'
+            text = f'next draw needs {need} B — about {wait_text}'
+
+        if bits > 0 and need > 0:
+            sustainable = bits / (need * cost)
+            text += f' · sustains {sustainable:.2g}/s'
+            try:
+                wanted = float(self.rate_var.get())
+            except (ValueError, self.tk.TclError):
+                wanted = 0.0
+            if self.auto_var.get() and wanted > sustainable * 1.05:
+                text += f' (repeat set to {wanted:g}/s — will throttle)'
+        return text
+
+    def _refresh_readiness(self) -> None:
+        """Recompute the readiness line after a range or mode change."""
+        if self._metrics:
+            self._render_metrics(self._metrics)
 
     def _on_close(self) -> None:
         self.worker.stop()

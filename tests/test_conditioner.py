@@ -9,6 +9,7 @@ import pytest
 from radiarandom.conditioner import (
     BLOCK_BYTES,
     BLOCK_COST_BITS,
+    STATE_CAPACITY_BITS,
     EntropyPool,
     HmacDrbg,
     serialize_batch,
@@ -50,15 +51,46 @@ def test_pool_releases_a_block_only_after_the_full_cost():
 
 
 def test_pool_charges_each_block_the_full_cost():
-    """Two blocks must cost twice as much; no free second block."""
+    """Each block costs the full price; no free second block."""
     pool = EntropyPool()
-    pool.absorb(b'x', 2 * BLOCK_COST_BITS)
-    assert pool.blocks_available == 2
-    pool.extract_block()
+    pool.absorb(b'x', BLOCK_COST_BITS)
     assert pool.blocks_available == 1
     pool.extract_block()
     assert pool.blocks_available == 0
     assert not pool.ready()
+    pool.absorb(b'y', BLOCK_COST_BITS)
+    assert pool.blocks_available == 1
+
+
+def test_pool_credit_saturates_at_its_state_size():
+    """A 512-bit HMAC state cannot hold more than 512 bits of entropy.
+
+    An earlier version counted credited bits without limit and was observed
+    claiming 2240 banked bits in a 512-bit state. Banking beyond one block is
+    the reservoir's job, not the pool's.
+    """
+    pool = EntropyPool()
+    for _ in range(10):
+        pool.absorb(b'x' * 8, BLOCK_COST_BITS)
+    assert pool.entropy_bits == pytest.approx(STATE_CAPACITY_BITS)
+    assert pool.blocks_available == 1
+    assert pool.stats()['bits_dropped_at_capacity'] > 0
+
+
+def test_absorb_reports_the_credit_actually_taken():
+    pool = EntropyPool()
+    assert pool.absorb(b'a', 100.0) == pytest.approx(100.0)
+    assert pool.absorb(b'b', 10_000.0) == pytest.approx(STATE_CAPACITY_BITS - 100.0)
+    assert pool.absorb(b'c', 50.0) == 0.0
+
+
+def test_fill_fraction_tracks_progress_toward_the_next_block():
+    pool = EntropyPool()
+    assert pool.fill_fraction == 0.0
+    pool.absorb(b'x', BLOCK_COST_BITS / 2)
+    assert pool.fill_fraction == pytest.approx(0.5)
+    pool.absorb(b'x', BLOCK_COST_BITS / 2)
+    assert pool.fill_fraction == pytest.approx(1.0)
 
 
 def test_unaccounted_data_gets_no_credit():

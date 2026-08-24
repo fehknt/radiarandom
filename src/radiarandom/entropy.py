@@ -84,6 +84,15 @@ DEFAULT_SAFETY_FACTOR = 0.9
 #: Photons the live estimator wants before its numbers are trusted.
 MCV_MIN_SAMPLES = 2000
 
+#: Effective memory of the live spectrum estimate, in photons.
+#:
+#: Without forgetting, the estimate is a cumulative average over the whole run:
+#: after an hour a change in the environment barely moves it, so the entropy
+#: budget would keep pricing the detector as it was rather than as it is.
+#: Exponential decay keeps it tracking current conditions. Roughly 20 minutes
+#: at 16 counts/s.
+MCV_HALF_LIFE_SAMPLES = 20000
+
 #: Longest gap we will pay for in one go. Guards against crediting a stall.
 MAX_CREDIT_GAP_S = 2.0
 
@@ -263,25 +272,55 @@ class RateEstimator:
 class MostCommonValue:
     """NIST SP 800-90B section 6.3.1 estimator, applied to channel values.
 
-    Used two ways: as a live sanity check that the detector's pulse-height
+    Used two ways: as a live check that the detector's pulse-height
     distribution has not degraded, and as the source of the ``p_max`` that
     sizes the health-test cutoffs.
+
+    Counts decay exponentially so the estimate follows the environment. Decay
+    shrinks the effective sample size, which widens the confidence margin and
+    therefore *lowers* the reported min-entropy -- the conservative direction.
     """
 
     Z = 2.576
 
-    def __init__(self, n_symbols: int) -> None:
+    def __init__(self, n_symbols: int,
+                 half_life: Optional[float] = MCV_HALF_LIFE_SAMPLES) -> None:
         self.n_symbols = n_symbols
-        self.counts = [0] * n_symbols
-        self.total = 0
+        self.counts = [0.0] * n_symbols
+        self.total = 0.0
+        self.half_life = half_life
+        self._since_decay = 0.0
 
     def update(self, symbols: Iterable[int]) -> None:
+        symbols = list(symbols)
+        n = len(symbols)
+        if not n:
+            return
+
+        if self.half_life:
+            # Decay the *existing* counts before the new ones are added --
+            # doing it afterwards ages the newest samples as if they were old,
+            # and a single large update would decay itself into irrelevance.
+            # Applied in chunks of a tenth of a half-life: 1024 multiplications
+            # that often is cheap, and the resulting over-ageing of the newest
+            # chunk is bounded at 10%.
+            self._since_decay += n
+            step = self.half_life / 10.0
+            if self._since_decay >= step:
+                self.decay(0.5 ** (self._since_decay / self.half_life))
+                self._since_decay = 0.0
+
         counts = self.counts
-        n = 0
         for symbol in symbols:
-            counts[symbol] += 1
-            n += 1
+            counts[symbol] += 1.0
         self.total += n
+
+    def decay(self, factor: float) -> None:
+        """Scale every count, forgetting the past at the given rate."""
+        if factor >= 1.0 or self.total <= 0:
+            return
+        self.counts = [c * factor for c in self.counts]
+        self.total *= factor
 
     def p_upper(self) -> Optional[float]:
         if self.total < MCV_MIN_SAMPLES:
@@ -296,7 +335,7 @@ class MostCommonValue:
             return None
         return -math.log2(p_upper)
 
-    def probabilities(self) -> Optional[list[float]]:
+    def probabilities(self) -> Optional[list]:
         """The observed channel distribution, once there is enough of it."""
         if self.total < MCV_MIN_SAMPLES:
             return None
