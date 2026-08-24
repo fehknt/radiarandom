@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_dieharder:
+        description: 'Run the complete Dieharder battery (hours, not minutes)'
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.9', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      # No detector in CI: the suite drives a simulated source from conftest.py,
+      # which can also be made to stall, collapse, or reset on demand.
+      - name: Unit tests
+        run: python -m pytest tests/ -q
+      - name: Portable battery self-test
+        run: python validation/localtests.py --self-test
+
+  estimators:
+    name: entropy estimator known-answer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The SP 800-90B estimators are the load-bearing part of the entropy
+      # claim, so verify them against sources whose min-entropy we know exactly
+      # before trusting them on detector data.
+      - name: Known-answer check
+        run: |
+          python - <<'PY'
+          import math, os, random, sys
+          sys.path.insert(0, 'validation')
+          import sp800_90b as sp
+
+          def check(name, samples, expected, tolerance):
+              result = sp.assess(samples, quick=True)
+              h = result['min_entropy_per_sample']
+              print(f'{name:<24} reported {h:7.4f}  true {expected:7.4f}  '
+                    f'binding {result["binding_estimator"]}')
+              assert h <= expected + tolerance, f'{name}: OVER-ESTIMATE, unsafe'
+              return h
+
+          rng = random.Random(1234)
+          # Must never over-estimate. Under-estimating is safe by design.
+          check('uniform bytes', list(os.urandom(60000)), 8.0, 0.05)
+          check('uniform 4-bit', [b & 0xF for b in os.urandom(60000)], 4.0, 0.05)
+          biased = [1 if rng.random() < 0.9 else 0 for _ in range(60000)]
+          check('biased bits p=0.9', biased, -math.log2(0.9), 0.02)
+          # A fully predictable source must report exactly zero.
+          h = check('period-8 counter', [i % 8 for i in range(60000)], 0.0, 1e-9)
+          assert h == 0.0, 'a predictable source must assess to zero'
+          print('all known-answer checks passed')
+          PY
+
+  dieharder:
+    name: dieharder against the DRBG
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dieharder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dieharder
+      - name: Install package
+        run: pip install -e .
+      # There is no detector in CI, so this exercises the conditioner and DRBG
+      # with an os.urandom seed. That is precisely the part Dieharder can speak
+      # to: it validates the output path, never the physics.
+      - name: Run battery
+        run: |
+          if [ "${{ inputs.full_dieharder }}" = "true" ]; then
+            ARGS="-a"
+          else
+            # A curated subset with reduced psamples, sized for CI minutes.
+            ARGS="-d 0 -d 1 -d 2 -d 3 -d 8 -d 10 -d 15 -d 16 -d 17 -d 100 -d 101 -d 102 -d 200 -d 201 -d 202 -d 203 -d 204 -p 20"
+          fi
+          python - <<'PY' | dieharder $ARGS -g 200 | tee dieharder.txt
+          import os, sys
+          from radiarandom.conditioner import HmacDrbg
+          drbg = HmacDrbg(os.urandom(32), os.urandom(32), b'ci')
+          out = sys.stdout.buffer
+          try:
+              while True:
+                  out.write(drbg.generate(1 << 20))
+          except (BrokenPipeError, OSError):
+              pass
+          PY
+      - name: Summarise
+        run: |
+          python validation/report.py --dieharder dieharder.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dieharder-transcript
+          path: dieharder.txt

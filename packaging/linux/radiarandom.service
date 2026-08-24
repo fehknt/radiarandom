@@ -1,0 +1,74 @@
+# systemd unit for the kernel entropy feeder.
+#
+# Install:
+#   sudo cp packaging/linux/99-radiacode.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   sudo groupadd -f radiarandom
+#   sudo useradd -r -g radiarandom -s /usr/sbin/nologin -d /nonexistent radiarandom
+#   sudo cp packaging/linux/radiarandom.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now radiarandom
+#
+# Watch it:
+#   systemctl status radiarandom
+#   journalctl -u radiarandom -f
+#   cat /proc/sys/kernel/random/entropy_avail
+#
+# The service runs unprivileged apart from CAP_SYS_ADMIN, which is the single
+# capability RNDADDENTROPY requires. Without it the daemon still works but
+# writes to /dev/random uncredited -- useful, but it will not raise
+# entropy_avail. Everything else is locked down.
+
+[Unit]
+Description=radiarandom - RadiaCode hardware entropy feeder
+Documentation=https://github.com/fehknt/radiarandom
+After=multi-user.target
+# The device must be present. Adjust the serial if you have more than one.
+Wants=dev-radiacode.device
+
+[Service]
+Type=simple
+User=radiarandom
+Group=radiarandom
+SupplementaryGroups=radiarandom
+
+ExecStart=/usr/local/bin/radiarandom feed --quiet --status-interval 300
+
+# RNDADDENTROPY is the only privileged operation. Nothing else is needed.
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=yes
+
+# The detector is slow: a 256-bit block takes ~26 s of background radiation,
+# and the start-up test needs ~4 minutes before anything is emitted at all.
+# Give it room before deciding a restart is warranted.
+TimeoutStartSec=600
+Restart=on-failure
+RestartSec=30
+# A health-test failure exits non-zero on purpose. Restarting in a tight loop
+# would just hide a genuinely broken detector, so back off hard.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+# Hardening. The daemon needs USB and /dev/random and nothing else.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+DeviceAllow=/dev/random rw
+DeviceAllow=char-usb_device rw
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

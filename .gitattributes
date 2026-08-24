@@ -1,0 +1,27 @@
+# Normalise line endings.
+#
+# This project is developed on Windows but its shell script, systemd unit and
+# udev rule are consumed by Linux. A CRLF shebang makes a script fail with
+# "bad interpreter", and systemd is equally unimpressed, so those files are
+# pinned to LF regardless of the checkout platform.
+
+* text=auto eol=lf
+
+*.sh            text eol=lf
+*.service       text eol=lf
+*.rules         text eol=lf
+Dockerfile      text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+
+# Validation transcripts are records; keep them byte-stable.
+validation/results/*.txt   text eol=lf
+validation/results/*.log   text eol=lf
+validation/results/*.json  text eol=lf
+
+*.bin           binary
+*.u16           binary
+
+LICENSE         text eol=lf

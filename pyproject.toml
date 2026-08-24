@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radiarandom"
+version = "1.0.0"
+description = "Hardware random number generator driven by a RadiaCode 103 gamma spectrometer"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "fehknt" }]
+keywords = ["rng", "hwrng", "entropy", "radiacode", "radioactivity", "nist-sp800-90b"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "radiacode>=0.4.0",
+]
+
+[project.optional-dependencies]
+# The bundled libusb build. Strongly recommended on Windows, where PyUSB will
+# otherwise pick up whatever stray libusb-1.0.dll is on PATH.
+usb = ["libusb-package>=1.0.26"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+radiarandom = "radiarandom.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fehknt/radiarandom"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

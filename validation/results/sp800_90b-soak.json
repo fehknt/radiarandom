@@ -1,0 +1,123 @@
+{
+  "samples": 7054,
+  "alphabet_size": 442,
+  "bit_width": 10,
+  "estimators": {
+    "most_common_value": {
+      "h_min": 5.480527010064652,
+      "samples": 7054,
+      "distinct": 442,
+      "mode": 37,
+      "mode_count": 129,
+      "p_hat": 0.018287496455911538,
+      "p_upper": 0.02239736759720279
+    },
+    "t_tuple": {
+      "h_min": 5.480527010064652,
+      "t": 1,
+      "p_hat": 0.018287496455911538,
+      "p_upper": 0.02239736759720279
+    },
+    "lrs": {
+      "h_min": 5.891754926857389,
+      "u": 2,
+      "v": 4,
+      "p_max": 0.016842441203408286
+    },
+    "multi_mcw": {
+      "h_min": 5.3458341430744465,
+      "predictions": 2959,
+      "correct": 54,
+      "p_global_hat": 0.018249408583981074,
+      "p_global_upper": 0.0245891531040227,
+      "longest_run": 1,
+      "p_local": 0.0018449738890759476,
+      "p_max": 0.0245891531040227,
+      "windows": [
+        63,
+        255,
+        1023,
+        4095
+      ]
+    },
+    "lag": {
+      "h_min": 6.108519695708002,
+      "predictions": 7022,
+      "correct": 79,
+      "p_global_hat": 0.011250356023924808,
+      "p_global_upper": 0.014492801451127654,
+      "longest_run": 2,
+      "p_local": 0.01131342182440168,
+      "p_max": 0.014492801451127654,
+      "best_lag": 1,
+      "max_lag": 32
+    },
+    "multi_mmc": {
+      "h_min": 5.308630675123432,
+      "predictions": 7051,
+      "correct": 147,
+      "p_global_hat": 0.02084810665153879,
+      "p_global_upper": 0.025231491925126047,
+      "longest_run": 2,
+      "p_local": 0.011297826514661245,
+      "p_max": 0.025231491925126047,
+      "depths": [
+        1,
+        2,
+        3
+      ],
+      "best_depth": 1
+    },
+    "lz78y": {
+      "h_min": 5.289837876921103,
+      "predictions": 7046,
+      "correct": 149,
+      "p_global_hat": 0.021146749929037752,
+      "p_global_upper": 0.025562311737278715,
+      "longest_run": 2,
+      "p_local": 0.01130050924037388,
+      "p_max": 0.025562311737278715,
+      "dictionary_size": 47667
+    },
+    "collision_per_bit": {
+      "h_min": 0.4673408653527522,
+      "collisions": 29298,
+      "mean_time": 2.4076728786947914,
+      "mean_lower": 2.4002773197579743,
+      "p_max": 0.7232965295767331,
+      "note": "binarised stream"
+    },
+    "markov_per_bit": {
+      "h_min": 0.5304243180214638,
+      "p_initial_upper": [
+        0.6600198241374,
+        0.3491988598481416
+      ],
+      "p_transition_upper": [
+        [
+          0.692611835107353,
+          0.31849866673912325
+        ],
+        [
+          0.6032886191875799,
+          0.4129319318135725
+        ]
+      ],
+      "chain_length": 128,
+      "note": "binarised stream"
+    },
+    "compression_per_bit": {
+      "h_min": 0.36913474103889077,
+      "blocks": 11756,
+      "mean": 4.761628234463754,
+      "mean_lower": 4.714208974059192,
+      "p_max": 0.21541513976440996,
+      "block_bits": 6,
+      "note": "binarised stream"
+    }
+  },
+  "min_entropy_per_sample": 3.6913474103889077,
+  "binding_estimator": "compression_per_bit",
+  "skipped_estimators": {},
+  "sufficient_samples": false
+}

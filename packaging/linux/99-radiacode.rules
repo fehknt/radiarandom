@@ -1,0 +1,23 @@
+# udev rule for the RadiaCode 10x family.
+#
+# Without this the device node is root-only and radiarandom must run as root
+# just to open USB -- which is a poor trade, because the daemon *also* wants
+# CAP_SYS_ADMIN for RNDADDENTROPY and you would rather grant that narrowly than
+# run the whole thing as root.
+#
+# Install:
+#   sudo cp packaging/linux/99-radiacode.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Verify:
+#   ls -l /dev/bus/usb/*/*      # look for the 0483:f123 device
+#   lsusb -d 0483:f123
+#
+# The rule grants access to the "radiarandom" system group. Create it and add
+# the service user (or yourself, for interactive use):
+#   sudo groupadd -f radiarandom
+#   sudo usermod -aG radiarandom "$USER"     # log out and back in afterwards
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="f123", \
+    MODE="0660", GROUP="radiarandom", TAG+="uaccess", \
+    SYMLINK+="radiacode-$attr{serial}"

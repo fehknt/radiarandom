@@ -1,0 +1,14 @@
+DRBG mode: HMAC_DRBG(SHA-512) seeded and continuously reseeded from the detector
+2026-08-23 19:27:16,570 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=2981, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:31:07,989 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=3026, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:35:02,594 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=2869, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:39:00,587 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=2982, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:42:53,514 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=3161, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:46:42,846 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=2970, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:50:44,434 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=3012, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:54:31,920 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=3127, dof=18); check for gain drift or a strong nearby source
+2026-08-23 19:58:59,828 WARNING radiarandom.generator: [warning] shape: spectrum shape deviates sharply from reference (chi2=2998, dof=18); check for gain drift or a strong nearby source
+2026-08-23 20:00:21,764 ERROR radiarandom.generator: [failure] rct: channel 24 repeated 7 times (cutoff 7)
+2026-08-23 20:00:21,764 ERROR radiarandom.generator: health failure in pump thread; stopping
+health failure: rct: channel 24 repeated 7 times (cutoff 7)
+the generator stops rather than emitting output it cannot vouch for.
