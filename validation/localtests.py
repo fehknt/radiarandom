@@ -498,25 +498,60 @@ def _print_report(report: dict) -> None:
         print('all tests passed')
 
 
+#: Failures tolerated on a known-good stream before the self-test complains.
+#:
+#: Demanding a clean sweep is a multiple-comparisons bug, and it bit: with 13
+#: graded tests at alpha = 0.01 the chance of at least one false failure on
+#: genuinely random data is 1 - 0.99^13 = 12.2%, so roughly one CI run in eight
+#: failed on perfectly good entropy. Tolerating one failure drops that to 0.7%,
+#: and the retry below squares it to about 1 in 20,000.
+SELF_TEST_TOLERATED_FAILURES = 1
+
+#: Failures a known-bad stream must produce for the battery to be believed.
+SELF_TEST_MIN_BAD_FAILURES = 3
+
+
 def self_test() -> int:
-    """Check the battery itself: a good stream should pass, a bad one fail."""
-    print('self-test: os.urandom (expected: pass)')
+    """Check the battery itself: a good stream passes, bad ones fail loudly."""
+    print('self-test: os.urandom (expected: at most '
+          f'{SELF_TEST_TOLERATED_FAILURES} failure)')
     good = run_battery(os.urandom(1 << 20))
     _print_report(good)
+    good_ok = len(good['failures']) <= SELF_TEST_TOLERATED_FAILURES
+
+    if not good_ok:
+        # One bad draw is expected noise; two in a row is a real problem.
+        print()
+        print('self-test: too many failures on random data — retrying once with '
+              'a fresh sample, since this is what statistical noise looks like')
+        good = run_battery(os.urandom(1 << 20))
+        _print_report(good)
+        good_ok = len(good['failures']) <= SELF_TEST_TOLERATED_FAILURES
 
     print()
-    print('self-test: a counter (expected: fail loudly)')
-    bad = bytes(i & 0xFF for i in range(1 << 20))
-    bad_report = run_battery(bad)
-    _print_report(bad_report)
+    print(f'self-test: a counter (expected: at least '
+          f'{SELF_TEST_MIN_BAD_FAILURES} failures)')
+    counter = run_battery(bytes(i & 0xFF for i in range(1 << 20)))
+    _print_report(counter)
 
     print()
-    print('self-test: LSB-stuck stream (expected: fail bit_position_bias)')
-    stuck = bytes(b | 1 for b in os.urandom(1 << 19))
-    stuck_report = run_battery(stuck)
-    _print_report(stuck_report)
+    print('self-test: LSB-stuck stream (expected: bit_position_bias among them)')
+    stuck = run_battery(bytes(b | 1 for b in os.urandom(1 << 19)))
+    _print_report(stuck)
 
-    ok = good['passed'] and not bad_report['passed'] and not stuck_report['passed']
+    checks = {
+        'good stream is accepted': good_ok,
+        'counter is rejected':
+            len(counter['failures']) >= SELF_TEST_MIN_BAD_FAILURES,
+        'stuck LSB is rejected':
+            len(stuck['failures']) >= SELF_TEST_MIN_BAD_FAILURES,
+        'stuck LSB is caught by the per-bit-position test':
+            'bit_position_bias' in stuck['failures'],
+    }
+    print()
+    for name, passed in checks.items():
+        print(f'  {"PASS" if passed else "FAIL"}  {name}')
+    ok = all(checks.values())
     print()
     print('SELF-TEST PASSED' if ok else 'SELF-TEST FAILED')
     return 0 if ok else 1
